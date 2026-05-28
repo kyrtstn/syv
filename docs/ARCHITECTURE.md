@@ -25,6 +25,9 @@ Before executing any specific module, `syv` initializes a global context (`CONFI
 ### The Ignore Mechanism (O(N) Path Pruning)
 To prevent the daemon from wasting CPU cycles, `syv` utilizes a path-pruning algorithm during its `os.walk()` traversal. By modifying the `dirs` array in-place (`dirs[:] = [d for d in dirs if not is_ignored(...)]`), the engine completely ignores branch execution for blacklisted directories like `node_modules` and `syv_cache`.
 
+### Pre-flight Validation & Security Hardening
+Before execution, `syv` validates all inputs. It blocks Path Traversal (`../`, `~`) in manifest keys, detects and refuses to follow malicious symlinks, and checks available disk space (`shutil.disk_usage`) before massive I/O operations to prevent `ENOSPC` kernel panics.
+
 ---
 
 ## 3. Module 1: The SPA Compiler (`compress_payloads`)
@@ -36,6 +39,7 @@ The SPA Compiler handles CPU-bound workloads (calculating MD5 hashes and Gzip co
 * **Worker Allocation:** The engine dynamically polls the host OS for logical core counts (`os.cpu_count()`).
 * **Thread Isolation:** Each file is passed to an isolated worker thread. The worker reads the binary, calculates the MD5 hash (for aggressive cache-busting), and writes the `.gz` payload.
 * **Error Boundaries:** Exceptions within a single thread are caught and logged independently. A single corrupted file will *not* crash the entire build process.
+* **Graceful Degradation:** If the thread pool triggers a `MemoryError` due to massive files or limited RAM, the compiler automatically degrades to a sequential processing queue instead of crashing, ensuring the CI/CD pipeline survives resource spikes.
 
 ### Build Pipeline (v5.1)
 The `syv build` command now executes a fully automated three-stage pipeline in sequence:
@@ -56,6 +60,9 @@ The `syv build` command now executes a fully automated three-stage pipeline in s
 4. **Atomic Write:** Only files whose content was actually modified are written back to disk, avoiding unnecessary I/O.
 5. **Dry-Run Compliance:** In `--dry-run` mode, the entire pipeline is simulated without writing to disk — the injected file count is still reported for verification.
 
+### Unicode Fallback Chain
+To support legacy codebases, the HTML parser utilizes a progressive fallback chain (`UTF-8` → `latin-1` → `cp1252` → `iso-8859-1`). This prevents pipeline failures when encountering malformed characters.
+
 ### The Backend Integration Contract (Before vs. After v5.1)
 
 **Before v5.1:** `syv build` generated `.gz` files and `build_manifest.json`. The backend server was required to read the manifest and rewrite HTML at request time.
@@ -73,12 +80,16 @@ Instead of relying on heavy third-party event libraries, `syv` uses a lightweigh
 * It stores the last modified timestamp (`os.path.getmtime`) of all valid files in memory.
 * The daemon sleeps for `1` second intervals, then executes a fast directory traversal.
 * If a file's `mtime` is newer than the memory state, it triggers a localized, single-file recompile and updates the manifest instantly.
+* **Memory & Resource Caps:** To prevent memory leaks during long development sessions, the watch state enforces a strict `MAX_WATCHED_FILES` limit (100,000) and runs a periodic garbage collection routine to purge stale file entries from memory.
 
 ---
 
 ## 6. Module 2: The SSG Scraper (`scrape_localhost`)
 
 The SSG Scraper is a highly concurrent, multi-page Static Site Generation (SSG) engine.
+
+### Network Resilience & SSRF Protection
+The scraper strictly enforces a localhost-only rule (`127.0.0.1` or `::1`) to prevent Server-Side Request Forgery (SSRF). Additionally, all network operations are wrapped in a custom `@with_retry` decorator using exponential backoff to survive temporary backend overloads.
 
 ### Execution Flow & Sitemap Discovery
 1. **Target Acquisition:** Constructs the target base URL.
