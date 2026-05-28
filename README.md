@@ -3,8 +3,8 @@
 
 [![Python 3.6+](https://img.shields.io/badge/python-3.6+-blue.svg)](https://www.python.org/downloads/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)]()
+[![Security Hardened](https://img.shields.io/badge/security-SSRF%20%7C%20Traversal%20Safe-red.svg)]()
 [![Platform: Linux | macOS | Windows | Termux](https://img.shields.io/badge/platform-POSIX%20%7C%20NT-lightgrey.svg)]()
-[![CI/CD Ready](https://img.shields.io/badge/CI%2FCD-Ready-success.svg)]()
 
 `syv` is a hyper-lightweight, multi-threaded optimization engine designed to sit between your raw development code and your production web servers. By natively handling **Single Page Application (SPA) payload compression**, **automatic DOM cache-busting injection**, and **Static Site Generation (SSG) caching**, `syv` drastically reduces Time-To-First-Byte (TTFB) and network latency without the bloat of modern JS frameworks.
 
@@ -18,39 +18,72 @@ Modern web development suffers from dependency fatigue. Tools like Webpack, Vite
 1. **The Zero-Dependency Oath:** Written entirely in standard Python 3. No `pip install`, no `npm install`, no virtual environments. You drop the binary into your system, and it runs instantly.
 2. **The UNIX Philosophy:** Do one thing, and do it perfectly. `syv` is not a web server. It is a file-generation middleware that generates mathematically hashed payloads and manifests for your actual server (Nginx, Express, FastAPI) to serve.
 3. **Bare-Metal Performance:** By utilizing `concurrent.futures` for multi-threading and low-level `os.path` polling for file watching, it maximizes hardware utilization (from 8-core desktop CPUs to ARM-based Termux environments).
-4. **Enterprise Reliability:** Built-in dry-runs, strict exit codes (`sys.exit(1)`), and silent modes make `syv` a bulletproof addition to any CI/CD pipeline.
+4. **Enterprise Reliability:** Built-in self-healing retries, granular POSIX exit codes, and actionable exception handling make `syv` a bulletproof, fault-tolerant addition to any CI/CD pipeline.
 
 ---
 
 ## ✨ Core Capabilities
 
-### 1. Multi-Core Payload Compression (SPA)
-When dealing with hundreds of heavy JavaScript and CSS files, sequential compression is a bottleneck. `syv` maps your build directory to a `ThreadPoolExecutor`, utilizing 100% of available CPU cores to calculate MD5 hashes and generate `.gz` gzip streams simultaneously.
+### 1. Security Hardening & Pre-flight Validation *(New in v5.1)*
+`syv` is built to withstand hostile environments and malicious inputs. The daemon includes strict validation layers:
+* **SSRF Prevention:** The SSG scraper strictly validates that all target URLs are localhost-bound (`127.0.0.1` or `::1`), preventing Server-Side Request Forgery attacks.
+* **Symlink & Path Traversal Blocking:** Refuses to follow symbolic links during cache removal and rejects manifest keys containing `../`, `/`, or `~` to prevent unauthorized file system access.
+* **Pre-flight Checks:** Automatically validates directory read/write permissions and checks `shutil.disk_usage` before initiating massive multi-threaded I/O operations to prevent disk-full crashes.
 
-### 2. Automatic DOM Cache-Busting Injection *(New in v5.1)*
-Previously, injecting hashed asset URLs into your HTML required your backend server to read `build_manifest.json` and rewrite `<script>` and `<link>` tags at runtime. `syv` now eliminates this backend dependency entirely. After every `syv build`, the **DOM Rewriter** automatically scans all `.html` files in your build directory and rewrites asset references in-place using the generated manifest.
+### 2. Fault-Tolerance & Self-Healing *(New in v5.1)*
+Network drops and memory spikes are a reality. `syv` handles them gracefully:
+* **Exponential Backoff:** Network operations (like sitemap scraping) utilize a `@with_retry` decorator with exponential backoff to survive temporary server overloads.
+* **Graceful Degradation:** If the multi-core `ThreadPoolExecutor` triggers a `MemoryError` on massive directories, `syv` automatically falls back to sequential processing instead of crashing.
+* **Unicode Fallback Chain:** Reads legacy files using a smart decoding chain (`UTF-8` → `latin-1` → `cp1252`), preventing pipeline failures due to malformed characters.
+
+### 3. Automatic DOM Cache-Busting Injection *(New in v5.1)*
+Injecting hashed asset URLs into your HTML shouldn't require backend logic. After every `syv build`, the **DOM Rewriter** scans all `.html` files in your build directory and rewrites asset references in-place using the generated `build_manifest.json`.
 
 **Before:**
 ```html
 <script src="app.js"></script>
-<link rel="stylesheet" href="styles.css">
 ```
 **After `syv build`:**
 ```html
 <script src="app.js?v=e3b0c4"></script>
-<link rel="stylesheet" href="styles.css?v=a1b2c3">
 ```
 
-This makes `syv` a fully self-contained, backend-agnostic optimization pipeline. Your static files are production-ready the moment `syv build` completes — no Node.js middleware, no FastAPI template logic required.
+### 4. Multi-Core Payload Compression (SPA)
+When dealing with hundreds of heavy JavaScript and CSS files, `syv` maps your build directory to an optimized thread pool, utilizing available CPU cores (capped dynamically to prevent resource exhaustion) to calculate MD5 hashes and generate `.gz` gzip streams simultaneously.
 
-### 3. Live Watch Daemon (Developer Experience)
-Instead of relying on heavy third-party filesystem event libraries (like `watchdog`), `syv watch` utilizes a highly optimized `os.path.getmtime` polling loop. It detects file saves in milliseconds, recompiling only the mutated asset and seamlessly rewriting the `build_manifest.json` without blocking the thread.
+### 5. Live Watch Daemon (Developer Experience)
+Instead of relying on heavy third-party filesystem event libraries, `syv watch` utilizes a highly optimized `os.path.getmtime` polling loop. It features a `MAX_WATCHED_FILES` limit (100,000 files) and periodic memory cleanup to ensure zero memory leaks during extended development sessions.
 
-### 4. Dynamic API Freezing & Multi-Page SSG
-Database queries are the enemy of speed. `syv run update` acts as a localized web crawler. It automatically detects `/sitemap.xml` and utilizes multi-threading to concurrently scrape and freeze your entire dynamic backend into a flat `./syv_cache/` directory alongside a Time-To-Live (TTL) metadata manifest.
+### 6. Dynamic API Freezing & Multi-Page SSG
+`syv run update` acts as a localized web crawler. It automatically detects `/sitemap.xml` and utilizes multi-threading to concurrently scrape and freeze your dynamic backend into a flat `./syv_cache/` directory alongside a Time-To-Live (TTL) metadata manifest.
 
-### 5. System Lifecycle Management
-Keep your environments clean. Automatically generate safe configurations using `syv init` and purge all optimization artifacts (`.gz`, manifests, caches) with a single `syv clean` command.
+---
+
+## 📂 Workspace Anatomy
+
+When `syv` is initialized and running in your project, it manages your workspace efficiently without cluttering it. Here is how your project structure will look:
+
+```text
+.
+├── syv                      # The core Zero-Dependency Python Daemon
+├── syv.json                 # Daemon configuration (Generated by `syv init`)
+├── installer/               
+│   └── install.bat          # Windows fast-installer & PATH injector
+├── dist/                    # Target SPA Build Directory (Your frontend output)
+│   ├── build_manifest.json  # Auto-generated MD5 version map
+│   ├── index.html           # DOM-rewritten HTML (auto-injected by syv)
+│   ├── js/
+│   │   ├── app.js           # Raw JS asset
+│   │   └── app.js.gz        # Multi-thread compressed gzip payload
+│   └── css/
+│       ├── style.css        # Raw CSS asset
+│       └── style.css.gz     # Compressed payload
+└── syv_cache/               # Local SSG Cache (Generated by `syv run update`)
+    ├── manifest.json        # TTL metadata & generation stats
+    ├── index.html           # Scraped root route
+    └── dashboard/
+        └── index.html       # Frozen dynamic endpoint
+```
 
 ---
 
@@ -58,75 +91,45 @@ Keep your environments clean. Automatically generate safe configurations using `
 
 Since `syv` is a standalone Python script, installation is simply making it executable and moving it to your system's PATH.
 
-**For Linux / macOS:**
+**For Linux / macOS / Termux:**
 ```bash
-curl -O https://raw.githubusercontent.com/kyrtstn/syv/main/syv
+curl -O [https://raw.githubusercontent.com/kyrtstn/syv/main/syv](https://raw.githubusercontent.com/kyrtstn/syv/main/syv)
 chmod +x syv
 sudo mv syv /usr/local/bin/
 ```
 
-**For Android / Termux:**
-```bash
-curl -O https://raw.githubusercontent.com/kyrtstn/syv/main/syv
-chmod +x syv
-mv syv $PREFIX/bin/
-```
-
 **For Windows (CMD / PowerShell):**
-`syv` is 100% Windows compatible (including native ANSI colors).
+`syv` is 100% Windows compatible (including native ANSI terminal aesthetics).
 
-1. Download the project or clone the repo.
-2. Run the installer:
+1. Clone the repo and run the installer:
    ```cmd
-   installer\install.cmd
+   installer\install.bat
    ```
-   It checks for Python 3.6+, copies `syv` + `syv.bat` to `%LOCALAPPDATA%\syv`, and adds it to your user `PATH`.
-3. Open a **new** terminal and verify:
+2. Open a **new** terminal and verify:
    ```cmd
    syv help
    ```
-
-To remove, run:
-```cmd
-installer\uninstall.cmd
-```
-
-Verify the daemon is active:
-```bash
-syv help
-```
 
 ---
 
 ## ⚙️ Configuration (`syv.json`)
 
-`syv` can be controlled entirely via CLI arguments, but for enterprise projects, it respects a `syv.json` file placed in the project root. You can instantly generate a template using `syv init`.
+`syv` respects a `syv.json` file placed in the project root. Generate a template using `syv init`.
 
 ```json
 {
   "port": 3000,
-  "ignore": [
-    "node_modules",
-    ".git",
-    ".venv",
-    "tests",
-    "syv_cache"
-  ],
+  "ignore": ["node_modules", ".git", ".venv", "tests", "syv_cache"],
   "ttl": 3600,
   "silent_mode": false
 }
 ```
-
-* **`ignore`:** Saves CPU cycles by pruning branch traversal during directory walking.
-* **`ttl`:** Establishes the Time-To-Live contract (in seconds) for the SSG cache.
-* **`silent_mode`:** When set to `true`, `syv` mutes all aesthetic logs (`[+]`, `[~]`) and only prints fatal errors, perfect for clean CI/CD logs.
 
 ---
 
 ## 🛠️ CLI Reference
 
 ### Global Utility
-Manage the daemon state and workspace safely.
 ```bash
 syv init                   # Generate default syv.json template
 syv clean ./dist           # Purge .gz files, manifests, and local cache
@@ -134,15 +137,13 @@ syv build ./dist --dry-run # Simulate operations without disk I/O
 ```
 
 ### SPA Operations (Frontend Bundles)
-Target your build directory to compress assets, generate the cache-busting manifest, and automatically rewrite HTML files.
 ```bash
 syv build ./dist           # Multi-threaded build + automatic DOM injection
 syv watch ./dist           # Initialize the live-reload daemon
-syv build ./dist --debug   # Enable millisecond thread execution logs
+syv build ./dist --debug   # Enable verbose, actionable execution logs
 ```
 
 ### SSG Operations (Backend Endpoints)
-Scrape the localhost port (and `sitemap.xml`) to generate static HTML cache.
 ```bash
 syv run update             # Scrapes default port (8080 or config port)
 syv run update -p 5000     # Scrape specific port
@@ -151,32 +152,35 @@ syv force run update       # Bypass TTL checks and force hard rebuild
 
 ---
 
-## 🤖 CI/CD Automation (GitHub Actions)
+## 🤖 CI/CD & Strict Exit Codes
 
-`syv` is designed to run in headless CI environments. It utilizes strict POSIX exit codes (`sys.exit(1)`) to ensure failing builds stop the deployment pipeline immediately.
+`syv` v5.1 features a highly structured exception hierarchy. It acts as a bulletproof CI/CD citizen by halting deployments on failure and returning granular POSIX exit codes to help automated runners diagnose the exact root cause.
 
-Below is a standard `.yaml` pipeline to automate your payload optimization before deployment.
+| Exit Code | Classification | Description |
+| :--- | :--- | :--- |
+| `0` | **Success** | Execution completed flawlessly. |
+| `1` | **Fatal Error** | General execution or unexpected thread failure. |
+| `2` | **Config Error** | Invalid `syv.json` syntax or bad CLI parameters (e.g., invalid port). |
+| `3` | **Network Error** | Connection timeouts, DNS failures, or completely dead routes. |
+| `7` | **Security Error** | SSRF attempts, path traversals, or symlink violations detected. |
+| `8` | **Resource Error** | System out of memory or thread explosion. |
+| `13` | **File System Error** | Permission denied, disk full (`ENOSPC`), or missing directories. |
 
+**Example GitHub Actions Pipeline:**
 ```yaml
 name: syv Optimization Pipeline
-on:
-  push:
-    branches: [ "main" ]
+on: [push]
 jobs:
   build-and-optimize:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      
       - name: Compile Source Code
         run: npm run build
-        
       - name: Optimize Payloads with syv
         run: |
           chmod +x ./syv
-          # Compresses assets, generates manifest, and rewrites HTML in one step
           ./syv build ./dist
-          
       - name: Deploy to Production
-        run: echo "Insert rsync, AWS S3, or Docker deployment here"
+        run: echo "Deploying highly optimized, secure payloads..."
 ```
