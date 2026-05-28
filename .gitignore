@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# syv build artifacts
+*.gz
+build_manifest.json
+syv_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+
+# Test
+test_project/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

@@ -10,8 +10,95 @@ import urllib.error
 import concurrent.futures
 import shutil
 import re
+import errno
+import traceback
+import socket
 from urllib.parse import urlparse
 from datetime import datetime
+
+
+# --- Console Encoding Safety ---
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+# --- Custom Exception Hierarchy ---
+class SYVException(Exception):
+    def __init__(self, message, operation=None, target=None, details=None, recovery=None, exit_code=1):
+        self.operation = operation
+        self.target = target
+        self.details = details
+        self.recovery = recovery
+        self.exit_code = exit_code
+        super().__init__(message)
+
+    def formatted(self):
+        lines = [
+            f"[!] {self.operation or 'SYV Error'}",
+            f" |- Operation: {self.operation or 'N/A'}",
+            f" |- Error Type: {type(self).__name__} ({self.args[0] if self.args else 'Unknown'})",
+        ]
+        if self.target:
+            lines.append(f" |- Target: {self.target}")
+        if self.details:
+            lines.append(f" |- Details: {self.details}")
+        if self.recovery:
+            lines.append(f" |- Suggested fix: {self.recovery}")
+        lines.append(f" \\- Exit Code: {self.exit_code}")
+        return "\n".join(lines)
+
+class ConfigError(SYVException):
+    def __init__(self, message, **kwargs):
+        kwargs.setdefault('operation', 'Configuration Validation')
+        kwargs.setdefault('exit_code', 2)
+        super().__init__(message, **kwargs)
+
+class FileSystemError(SYVException):
+    def __init__(self, message, **kwargs):
+        kwargs.setdefault('operation', 'File System Operation')
+        kwargs.setdefault('exit_code', 13)
+        super().__init__(message, **kwargs)
+
+class NetworkError(SYVException):
+    def __init__(self, message, **kwargs):
+        kwargs.setdefault('operation', 'Network Request')
+        kwargs.setdefault('exit_code', 3)
+        super().__init__(message, **kwargs)
+
+class SYVNetworkTimeoutError(NetworkError):
+    def __init__(self, message, **kwargs):
+        kwargs.setdefault('details', 'Connection timed out - server may be overloaded or unreachable')
+        kwargs.setdefault('recovery', 'Check server status, increase timeout, or retry later')
+        super().__init__(message, **kwargs)
+
+class SYVConnectionRefusedError(NetworkError):
+    def __init__(self, message, **kwargs):
+        kwargs.setdefault('details', 'Connection refused - no server listening on target port')
+        kwargs.setdefault('recovery', 'Verify the server is running and the port is correct')
+        super().__init__(message, **kwargs)
+
+class SYVSSRFRiskError(NetworkError):
+    def __init__(self, message, **kwargs):
+        kwargs.setdefault('operation', 'SSRF Prevention')
+        kwargs.setdefault('details', 'Target URL is not localhost-bound - blocking to prevent SSRF attack')
+        kwargs.setdefault('recovery', 'Only URLs pointing to 127.0.0.1 or localhost are allowed')
+        kwargs.setdefault('exit_code', 7)
+        super().__init__(message, **kwargs)
+
+class SecurityError(SYVException):
+    def __init__(self, message, **kwargs):
+        kwargs.setdefault('operation', 'Security Check')
+        kwargs.setdefault('exit_code', 7)
+        super().__init__(message, **kwargs)
+
+class ResourceError(SYVException):
+    def __init__(self, message, **kwargs):
+        kwargs.setdefault('operation', 'Resource Management')
+        kwargs.setdefault('exit_code', 8)
+        super().__init__(message, **kwargs)
+
 
 # --- Cyber-Security Terminal Aesthetics ---
 C_GREEN = '\033[92m'
@@ -27,13 +114,25 @@ CONFIG = {"port": 8080, "ignore": ["node_modules", ".git", ".venv", "tests"], "t
 
 REPO_URL = "https://raw.githubusercontent.com/kyrtstn/syv/main/syv"
 
+
+# --- Structured Error Logging ---
+def log_error(category, message, context=None, recovery=None, exit_code=1):
+    sys.stdout.write(f"\n{C_ORANGE}[!] {category}: {message}{C_RESET}\n")
+    if context:
+        for key, value in context.items():
+            sys.stdout.write(f"  {C_DARK_GREY}|- {key}: {value}{C_RESET}\n")
+    if recovery:
+        sys.stdout.write(f"  {C_CYAN}|- Suggested fix: {recovery}{C_RESET}\n")
+    if exit_code:
+        sys.stdout.write(f"  {C_DARK_GREY}\\- Exit Code: {exit_code}{C_RESET}\n")
+
+
 def log_info(msg):
     if CONFIG.get("silent_mode", False) and not DEBUG_MODE: return
     prefix = "[DRY-RUN] " if DRY_RUN_MODE else ""
     print(f"{C_DARK_GREY}[{C_GREEN}+{C_DARK_GREY}]{C_RESET} {C_GREEN}{prefix}{C_RESET}{msg}")
 
 def log_warn(msg):
-    # Warnings are always printed regardless of silent_mode
     prefix = "[DRY-RUN] " if DRY_RUN_MODE else ""
     print(f"{C_DARK_GREY}[{C_ORANGE}!{C_DARK_GREY}]{C_RESET} {C_ORANGE}{prefix}{msg}{C_RESET}")
 
@@ -54,12 +153,116 @@ def print_progress(current, total, prefix='Optimizing', length=30):
         return
     percent = ("{0:.1f}").format(100 * (current / float(total)))
     filled_length = int(length * current // total)
-    bar = '█' * filled_length + '-' * (length - filled_length)
+    bar = '#' * filled_length + '-' * (length - filled_length)
     dry_tag = " (DRY-RUN)" if DRY_RUN_MODE else ""
     sys.stdout.write(f'\r\033[K{C_DARK_GREY}[{C_CYAN}~{C_DARK_GREY}]{C_RESET} {prefix}{dry_tag} |{C_GREEN}{bar}{C_RESET}| {percent}% [{current}/{total}]')
     sys.stdout.flush()
     if current == total:
         sys.stdout.write('\n')
+
+
+# --- Validation & Pre-flight Checks ---
+def validate_config(config):
+    errors = []
+    port = config.get("port", 8080)
+    if not isinstance(port, int):
+        errors.append(ConfigError(f"Port must be an integer, got {type(port).__name__}", target="port", recovery="Set port to a valid integer (e.g., 8080)"))
+    else:
+        try:
+            validate_port(port)
+        except ConfigError as e:
+            errors.append(e)
+    ttl = config.get("ttl", 3600)
+    if not isinstance(ttl, int):
+        errors.append(ConfigError(f"TTL must be an integer, got {type(ttl).__name__}", target="ttl", recovery="Set ttl to a valid integer (e.g., 3600)"))
+    elif ttl < 0:
+        errors.append(ConfigError(f"TTL cannot be negative ({ttl})", target="ttl", recovery="Set ttl to a non-negative value"))
+    silent = config.get("silent_mode", False)
+    if not isinstance(silent, bool):
+        errors.append(ConfigError(f"silent_mode must be a boolean, got {type(silent).__name__}", target="silent_mode", recovery="Set silent_mode to true or false"))
+    ignore = config.get("ignore", [])
+    if not isinstance(ignore, list):
+        errors.append(ConfigError(f"ignore must be a list, got {type(ignore).__name__}", target="ignore", recovery="Set ignore to a list of directory names"))
+    elif not all(isinstance(i, str) for i in ignore):
+        errors.append(ConfigError(f"Each ignore pattern must be a string", target="ignore", recovery="Ensure all entries in ignore are strings"))
+    return errors
+
+def validate_directory_readable(path):
+    if not os.path.exists(path):
+        raise FileSystemError(f"Directory does not exist: {path}", target=path, recovery=f"Create the directory: mkdir -p {path}")
+    if os.path.islink(path):
+        real_path = os.path.realpath(path)
+        raise SecurityError(f"Path is a symlink: {path} -> {real_path}", target=path, details="Symlinks can be used for path traversal attacks", recovery=f"Use the real path directly: {real_path}")
+    if not os.access(path, os.R_OK):
+        raise FileSystemError(f"No read permission for directory: {path}", target=path, recovery=f"Grant read permission: chmod +r {path}")
+    return True
+
+def validate_directory_writable(path):
+    if not os.path.exists(path):
+        try:
+            os.makedirs(path, exist_ok=True)
+        except PermissionError:
+            raise FileSystemError(f"Cannot create directory (permission denied): {path}", target=path, recovery=f"Check parent directory permissions or run: mkdir -p {path}")
+        except OSError as e:
+            raise FileSystemError(f"Cannot create directory: {path}", target=path, details=str(e), recovery=f"Check disk space and permissions")
+    if os.path.islink(path):
+        real_path = os.path.realpath(path)
+        raise SecurityError(f"Path is a symlink: {path} -> {real_path}", target=path, details="Symlinks can be used for path traversal attacks", recovery=f"Use the real path directly: {real_path}")
+    if not os.access(path, os.W_OK):
+        raise FileSystemError(f"No write permission for directory: {path}", target=path, recovery=f"Grant write permission: chmod +w {path}")
+    try:
+        usage = shutil.disk_usage(os.path.dirname(path) or ".")
+        free_bytes = usage.free
+        if free_bytes < 104857600:
+            free_mb = free_bytes / 1048576
+            raise FileSystemError(f"Low disk space: only {free_mb:.1f} MB free", target=path, details=f"At least 100 MB recommended, {free_mb:.1f} MB available", recovery="Free up disk space or use a different drive")
+    except OSError:
+        pass
+    return True
+
+def validate_port(port):
+    if not isinstance(port, int):
+        raise ConfigError(f"Port must be an integer, got {type(port).__name__}", target="port", recovery="Specify a numeric port (e.g., --port 8080)")
+    if port < 1 or port > 65535:
+        raise ConfigError(f"Port {port} is out of valid range (1-65535)", target="port", recovery=f"Use a port between 1 and 65535 (suggested: 8080, 3000, 8000)")
+    if port < 1024 and os.name != 'nt':
+        raise ConfigError(f"Port {port} is a privileged port (< 1024)", target="port", recovery=f"Use a port >= 1024 or run with elevated privileges")
+    return True
+
+def validate_url_safe(url):
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+    if hostname not in ("127.0.0.1", "localhost", "::1"):
+        raise SYVSSRFRiskError(f"URL target is not localhost-bound: {url}", target=url, recovery="Only localhost URLs (127.0.0.1 or localhost) are allowed for security")
+    return True
+
+def validate_manifest_keys(manifest):
+    for key in manifest:
+        if ".." in key or key.startswith("/") or "~" in key:
+            raise SecurityError(f"Path traversal detected in manifest key: {key}", target=key, details="Manifest keys must not contain path traversal sequences", recovery="Remove '..', '/', or '~' from manifest keys")
+    return True
+
+
+# --- Retry Logic ---
+def with_retry(max_retries=3, base_delay=1, exceptions=(Exception,)):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    last_exc = e
+                    if attempt < max_retries:
+                        delay = base_delay * (2 ** attempt)
+                        log_debug(f"Retry {attempt + 1}/{max_retries} for {func.__name__} in {delay}s: {e}")
+                        time.sleep(delay)
+                    else:
+                        log_debug(f"All {max_retries} retries exhausted for {func.__name__}: {e}")
+            raise last_exc
+        return wrapper
+    return decorator
+
 
 # --- Config & Setup ---
 def load_config():
@@ -67,25 +270,33 @@ def load_config():
     config_path = "syv.json"
     if os.path.exists(config_path):
         try:
-            with open(config_path, 'r') as f:
+            with open(config_path, 'r', encoding='utf-8') as f:
                 user_config = json.load(f)
             allowed_keys = {"port", "ignore", "ttl", "silent_mode"}
             for key in allowed_keys:
                 if key in user_config:
                     CONFIG[key] = user_config[key]
+            errors = validate_config(CONFIG)
+            if errors:
+                for err in errors:
+                    log_warn(err.formatted())
+                log_sys("Configuration has warnings - continuing with best-effort values.")
             log_sys("syv.json configuration loaded.")
             log_debug(f"Active Config: {CONFIG}")
         except json.JSONDecodeError as e:
-            log_warn(f"Failed to parse syv.json (invalid JSON). Using defaults. Error: {e}")
+            log_error("CONFIG", f"Failed to parse syv.json (invalid JSON at line {e.lineno}, col {e.colno})", {"path": config_path, "error": str(e)}, "Fix the JSON syntax in syv.json", exit_code=2)
+        except PermissionError as e:
+            log_error("CONFIG", f"Cannot read syv.json (permission denied)", {"path": config_path, "error": str(e)}, f"Check file permissions: chmod 644 {config_path}", exit_code=13)
         except Exception as e:
-            log_warn(f"Failed to read syv.json. Using defaults. Error: {e}")
+            log_error("CONFIG", f"Failed to read syv.json", {"path": config_path, "error": str(e)}, "Ensure syv.json exists and is readable", exit_code=1)
 
 def sys_start():
     log_info("Initializing syv system daemon...")
     time.sleep(0.3)
     if os.name == 'nt':
-        os.system('color') # Enable ANSI colors for Windows CMD
-    log_sys(f"Environment paths & CPU cores ({os.cpu_count()}) verified.")
+        os.system('color')
+    cpu_count = os.cpu_count() or 1
+    log_sys(f"Environment paths & CPU cores ({cpu_count}) verified.")
     log_info("Daemon ready. Awaiting operational commands.")
 
 def sys_init():
@@ -93,41 +304,64 @@ def sys_init():
     if os.path.exists(config_path):
         log_warn("syv.json already exists in this directory.")
         return
-    
     default_config = {
         "port": 8080,
         "ignore": ["node_modules", ".git", ".venv", "tests", "syv_cache"],
         "ttl": 3600,
         "silent_mode": False
     }
-    
     if not DRY_RUN_MODE:
-        with open(config_path, 'w') as f:
-            json.dump(default_config, f, indent=4)
-        log_info("Generated syv.json configuration template.")
+        try:
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(default_config, f, indent=4)
+            log_info("Generated syv.json configuration template.")
+        except PermissionError as e:
+            log_error("CONFIG", f"Cannot write syv.json (permission denied)", {"path": config_path, "error": str(e)}, "Check directory permissions", exit_code=13)
+        except OSError as e:
+            log_error("CONFIG", f"Cannot write syv.json (disk full?)", {"path": config_path, "error": str(e)}, "Free up disk space and retry", exit_code=13)
     else:
         log_info("Would generate syv.json configuration template.")
 
 def clean_system(target_dir):
     log_sys(f"Initiating clean sweep on '{target_dir}' and './syv_cache'...")
     deleted_files = 0
-    
-    if os.path.exists("./syv_cache"):
-        if not DRY_RUN_MODE:
-            shutil.rmtree("./syv_cache")
-        log_info("Purged ./syv_cache directory.")
-    
+    try:
+        if os.path.exists("./syv_cache"):
+            if not DRY_RUN_MODE:
+                if os.path.islink("./syv_cache"):
+                    raise SecurityError("Refusing to remove symlinked cache directory", target="./syv_cache", recovery="Remove the symlink manually if intended")
+                shutil.rmtree("./syv_cache")
+            log_info("Purged ./syv_cache directory.")
+    except PermissionError as e:
+        log_error("CLEAN", f"Cannot remove syv_cache (permission denied)", {"path": "./syv_cache", "error": str(e)}, "Check file ownership or run with appropriate permissions", exit_code=13)
+    except SecurityError as e:
+        log_warn(e.formatted())
     if os.path.exists(target_dir):
+        try:
+            validate_directory_readable(target_dir)
+        except (FileSystemError, SecurityError) as e:
+            log_warn(e.formatted())
+            return
         for root, dirs, files in os.walk(target_dir):
             for file in files:
                 if file.endswith('.gz') or file == "build_manifest.json":
                     filepath = os.path.join(root, file)
                     if not DRY_RUN_MODE:
-                        os.remove(filepath)
+                        try:
+                            if os.path.islink(filepath):
+                                log_debug(f"Skipping symlink: {filepath}")
+                                continue
+                            os.remove(filepath)
+                        except PermissionError as e:
+                            log_error("CLEAN", f"Cannot remove {filepath} (permission denied)", {"error": str(e)}, f"Check permissions: chmod 644 {filepath}", exit_code=13)
+                            continue
+                        except OSError as e:
+                            log_error("CLEAN", f"Cannot remove {filepath}", {"error": str(e)}, "Check if file is in use by another process", exit_code=13)
+                            continue
                     deleted_files += 1
                     log_debug(f"Deleted: {filepath}")
-                    
     log_info(f"Clean sweep complete. Removed {deleted_files} optimization artifacts.")
+
 
 # --- MODULE 1: SPA Build Optimizer ---
 def is_ignored(filepath):
@@ -138,157 +372,269 @@ def is_ignored(filepath):
 
 def generate_file_hash(filepath):
     hasher = hashlib.md5()
-    with open(filepath, 'rb') as afile:
-        buf = afile.read()
-        hasher.update(buf)
+    try:
+        with open(filepath, 'rb') as afile:
+            buf = afile.read()
+            hasher.update(buf)
+    except PermissionError as e:
+        raise FileSystemError(f"Cannot read file (permission denied): {filepath}", target=filepath, details=str(e), recovery=f"Check file permissions: chmod 644 {filepath}")
+    except OSError as e:
+        raise FileSystemError(f"Cannot read file: {filepath}", target=filepath, details=str(e), recovery="Check if file exists and is accessible")
     return hasher.hexdigest()[:8]
 
 def process_single_file(filepath):
     start_time = time.time()
+    try:
+        validate_directory_readable(os.path.dirname(filepath) or ".")
+    except (FileSystemError, SecurityError) as e:
+        log_warn(e.formatted())
+        return {}, 0
     file_hash = generate_file_hash(filepath)
     filename = os.path.basename(filepath)
     manifest_entry = {filename: f"{filename}?v={file_hash}"}
-
-    with open(filepath, 'rb') as f_in:
-        original_data = f_in.read()
-        original_size = len(original_data)
-
+    try:
+        with open(filepath, 'rb') as f_in:
+            original_data = f_in.read()
+            original_size = len(original_data)
+    except PermissionError as e:
+        raise FileSystemError(f"Cannot read file (permission denied): {filepath}", target=filepath, details=str(e), recovery=f"chmod 644 {filepath}")
+    except OSError as e:
+        raise FileSystemError(f"Cannot read file: {filepath}", target=filepath, details=str(e), recovery="Check if file exists and is accessible")
     gz_filepath = filepath + '.gz'
-    compressed_size = original_size # Default if dry-run
-    
+    compressed_size = original_size
     if not DRY_RUN_MODE:
-        with gzip.open(gz_filepath, 'wb') as f_out:
-            f_out.write(original_data)
-        compressed_size = os.path.getsize(gz_filepath)
-        
+        try:
+            with gzip.open(gz_filepath, 'wb') as f_out:
+                f_out.write(original_data)
+            compressed_size = os.path.getsize(gz_filepath)
+        except PermissionError as e:
+            raise FileSystemError(f"Cannot write compressed file (permission denied): {gz_filepath}", target=gz_filepath, details=str(e), recovery=f"chmod +w {os.path.dirname(gz_filepath)}")
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                try:
+                    free = shutil.disk_usage(os.path.dirname(gz_filepath) or ".").free
+                except OSError:
+                    free = 0
+                needed = len(original_data)
+                raise FileSystemError(f"Disk full while writing {gz_filepath}", target=gz_filepath, details=f"Need ~{needed} bytes, only {free} available", recovery="Free up disk space or reduce file sizes")
+            raise FileSystemError(f"Failed to write compressed file: {gz_filepath}", target=gz_filepath, details=str(e), recovery="Check disk space and permissions")
     saved_bytes = original_size - compressed_size
-
     log_debug(f"Processed {filename} in {(time.time() - start_time)*1000:.2f}ms (Saved {saved_bytes} bytes)")
     return manifest_entry, saved_bytes
 
 def compress_payloads(target_dir):
     log_sys(f"Scanning directory: {target_dir}")
     if not os.path.exists(target_dir):
-        log_warn(f"Directory '{target_dir}' not found.")
+        log_error("BUILD", f"Target directory not found: {target_dir}", recovery=f"Create the directory or specify a valid path: syv build ./dist", exit_code=1)
         sys.exit(1)
-
+    try:
+        validate_directory_readable(target_dir)
+    except (FileSystemError, SecurityError) as e:
+        log_warn(e.formatted())
+        sys.exit(1)
     files_to_process = []
     for root, dirs, files in os.walk(target_dir):
         dirs[:] = [d for d in dirs if not is_ignored(os.path.join(root, d))]
         for file in files:
             if file.endswith('.js') or file.endswith('.css'):
                 files_to_process.append(os.path.join(root, file))
-
     total_files = len(files_to_process)
     if total_files == 0:
         log_warn("No target files found to compress.")
         return
-
     log_info(f"Discovered {total_files} payloads. Engaging multi-core compression...")
     manifest = {}
     total_saved_bytes = 0
     completed_files = 0
-    optimal_threads = os.cpu_count() or 4
-
+    cpu_count = os.cpu_count() or 4
+    optimal_threads = min(cpu_count, 16)
     t_start = time.time()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_threads) as executor:
-        future_to_file = {executor.submit(process_single_file, filepath): filepath for filepath in files_to_process}
-        print_progress(0, total_files)
-        for future in concurrent.futures.as_completed(future_to_file):
-            try:
-                manifest_entry, saved_bytes = future.result()
-                manifest.update(manifest_entry)
-                total_saved_bytes += saved_bytes
-                completed_files += 1
-                print_progress(completed_files, total_files)
-            except Exception as exc:
-                sys.stdout.write(f"\n{C_ORANGE}[!] Thread exception: {exc}{C_RESET}\n")
-
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_threads) as executor:
+            future_to_file = {executor.submit(process_single_file, filepath): filepath for filepath in files_to_process}
+            print_progress(0, total_files)
+            for future in concurrent.futures.as_completed(future_to_file):
+                try:
+                    manifest_entry, saved_bytes = future.result()
+                    manifest.update(manifest_entry)
+                    total_saved_bytes += saved_bytes
+                    completed_files += 1
+                    print_progress(completed_files, total_files)
+                except FileSystemError as exc:
+                    log_error("BUILD", str(exc), {"file": future_to_file[future]}, exc.recovery, exc.exit_code)
+                except Exception as exc:
+                    log_error("BUILD", f"Unexpected thread failure", {"file": future_to_file.get(future, "unknown"), "error": str(exc)}, "Check file integrity and permissions", exit_code=1)
+    except MemoryError:
+        log_error("BUILD", "Out of memory - too many threads or large files", {"threads": optimal_threads, "files": total_files}, "Reduce the number of concurrent workers or file sizes", exit_code=8)
+        if total_files > 0:
+            log_sys("Falling back to sequential processing...")
+            for filepath in files_to_process:
+                try:
+                    manifest_entry, saved_bytes = process_single_file(filepath)
+                    manifest.update(manifest_entry)
+                    total_saved_bytes += saved_bytes
+                    completed_files += 1
+                    print_progress(completed_files, total_files)
+                except Exception as exc:
+                    log_error("BUILD", f"Sequential processing failed", {"file": filepath, "error": str(exc)}, "", exit_code=1)
     if not DRY_RUN_MODE:
         manifest_path = os.path.join(target_dir, "build_manifest.json")
-        with open(manifest_path, 'w') as mf:
-            json.dump(manifest, mf, indent=4)
+        try:
+            validate_manifest_keys(manifest)
+            with open(manifest_path, 'w', encoding='utf-8') as mf:
+                json.dump(manifest, mf, indent=4)
+        except SecurityError as e:
+            log_error("BUILD", str(e), {"manifest": manifest_path}, e.recovery, e.exit_code)
+        except PermissionError as e:
+            log_error("BUILD", f"Cannot write manifest (permission denied)", {"path": manifest_path, "error": str(e)}, f"chmod +w {target_dir}", exit_code=13)
         rewrite_html_dom(target_dir)
     else:
-        rewrite_html_dom(target_dir)  # dry-run modunda da simüle et
-
+        rewrite_html_dom(target_dir)
     log_info(f"SPA Protocol Complete in {time.time() - t_start:.2f}s. Saved {total_saved_bytes / 1024 / 1024:.2f} MB.")
 
+
 # --- MODULE 1.5: DOM Rewriter ---
+def read_file_with_fallback(filepath):
+    encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+    for encoding in encodings:
+        try:
+            with open(filepath, 'r', encoding=encoding) as f:
+                return f.read()
+        except UnicodeDecodeError:
+            continue
+        except PermissionError as e:
+            raise FileSystemError(f"Cannot read file (permission denied): {filepath}", target=filepath, details=str(e), recovery=f"chmod 644 {filepath}")
+        except OSError as e:
+            raise FileSystemError(f"Cannot read file: {filepath}", target=filepath, details=str(e), recovery="Check if file exists and is accessible")
+    raise FileSystemError(f"Cannot decode file with any supported encoding: {filepath}", target=filepath, details="Tried: utf-8, latin-1, cp1252, iso-8859-1", recovery="Convert the file to UTF-8 encoding")
+
 def rewrite_html_dom(target_dir):
     log_sys("Initiating DOM Rewriter protocol...")
     manifest_path = os.path.join(target_dir, "build_manifest.json")
     if not os.path.exists(manifest_path):
         log_warn("No build_manifest.json found. Skipping HTML injection.")
         return
-
-    with open(manifest_path, 'r') as mf:
-        manifest = json.load(mf)
-
+    try:
+        with open(manifest_path, 'r', encoding='utf-8') as mf:
+            manifest = json.load(mf)
+        validate_manifest_keys(manifest)
+    except json.JSONDecodeError as e:
+        log_error("DOM", f"Invalid manifest JSON at line {e.lineno}", {"path": manifest_path, "error": str(e)}, "Fix the build_manifest.json file", exit_code=2)
+        return
+    except SecurityError as e:
+        log_error("DOM", str(e), {"manifest": manifest_path}, e.recovery, e.exit_code)
+        return
     injected_count = 0
     for root, dirs, files in os.walk(target_dir):
         dirs[:] = [d for d in dirs if not is_ignored(os.path.join(root, d))]
         for file in files:
             if file.endswith('.html'):
                 filepath = os.path.join(root, file)
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    content = f.read()
+                try:
+                    content = read_file_with_fallback(filepath)
+                except FileSystemError as e:
+                    log_warn(e.formatted())
+                    continue
                 original = content
                 for orig, vers in manifest.items():
-                    pattern = r'((?:src|href)=["\'][^"\']*?)(' + re.escape(orig) + r')(["\'])'
+                    safe_orig = re.escape(orig)
+                    pattern = r'((?:src|href)=["\'][^"\']*?)(' + safe_orig + r')(["\'])'
                     content = re.sub(pattern, r'\g<1>' + vers + r'\g<3>', content)
                 if content != original:
                     if not DRY_RUN_MODE:
-                        with open(filepath, 'w', encoding='utf-8') as f:
-                            f.write(content)
+                        try:
+                            with open(filepath, 'w', encoding='utf-8') as f:
+                                f.write(content)
+                        except PermissionError as e:
+                            log_error("DOM", f"Cannot write HTML file (permission denied)", {"path": filepath, "error": str(e)}, f"chmod +w {filepath}", exit_code=13)
+                            continue
+                        except OSError as e:
+                            log_error("DOM", f"Cannot write HTML file", {"path": filepath, "error": str(e)}, "Check disk space and permissions", exit_code=13)
+                            continue
                     injected_count += 1
                     log_debug(f"Injected cache-busting hashes into: {file}")
-
     log_info(f"DOM Rewrite Complete. Updated {injected_count} HTML files.")
+
 
 # --- MODULE 1B: Watch Mode Daemon ---
 def watch_payloads(target_dir):
     log_sys(f"Initializing Watch Daemon on: {target_dir}")
     if not os.path.exists(target_dir):
-        log_warn("Target directory not found.")
+        log_error("WATCH", f"Target directory not found: {target_dir}", recovery=f"Create the directory or specify a valid path: syv watch ./dist", exit_code=1)
         sys.exit(1)
-
+    try:
+        validate_directory_readable(target_dir)
+    except (FileSystemError, SecurityError) as e:
+        log_warn(e.formatted())
+        sys.exit(1)
     file_states = {}
+    MAX_WATCHED_FILES = 100000
     manifest_path = os.path.join(target_dir, "build_manifest.json")
     manifest = {}
-
+    cleanup_counter = 0
     if os.path.exists(manifest_path) and not DRY_RUN_MODE:
-        with open(manifest_path, 'r') as mf:
-            manifest = json.load(mf)
-
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as mf:
+                manifest = json.load(mf)
+        except (json.JSONDecodeError, PermissionError) as e:
+            log_warn(f"Could not load existing manifest: {e}")
     log_info("Watching for file changes... (Press Ctrl+C to exit)")
-
     try:
         while True:
-            for root, dirs, files in os.walk(target_dir):
-                dirs[:] = [d for d in dirs if not is_ignored(os.path.join(root, d))]
-                for file in files:
-                    if file.endswith('.js') or file.endswith('.css'):
-                        filepath = os.path.join(root, file)
-                        mtime = os.path.getmtime(filepath)
-
-                        if filepath not in file_states:
-                            file_states[filepath] = mtime
-                        elif file_states[filepath] < mtime:
-                            log_info(f"Change detected: {file}")
-                            file_states[filepath] = mtime
-
-                            manifest_entry, _ = process_single_file(filepath)
-                            manifest.update(manifest_entry)
-
-                            if not DRY_RUN_MODE:
-                                with open(manifest_path, 'w') as mf:
-                                    json.dump(manifest, mf, indent=4)
-                            log_sys("Cache updated and manifest rewritten.")
+            try:
+                for root, dirs, files in os.walk(target_dir):
+                    dirs[:] = [d for d in dirs if not is_ignored(os.path.join(root, d))]
+                    for file in files:
+                        if file.endswith('.js') or file.endswith('.css'):
+                            filepath = os.path.join(root, file)
+                            try:
+                                mtime = os.path.getmtime(filepath)
+                            except OSError:
+                                continue
+                            if filepath not in file_states:
+                                if len(file_states) >= MAX_WATCHED_FILES:
+                                    log_warn(f"Watch limit reached ({MAX_WATCHED_FILES} files).")
+                                    continue
+                                file_states[filepath] = mtime
+                            elif file_states[filepath] < mtime:
+                                log_info(f"Change detected: {file}")
+                                file_states[filepath] = mtime
+                                try:
+                                    manifest_entry, _ = process_single_file(filepath)
+                                    manifest.update(manifest_entry)
+                                except (FileSystemError, OSError) as e:
+                                    log_error("WATCH", f"Failed to process changed file", {"file": filepath, "error": str(e)}, "Check file permissions", exit_code=13)
+                                    continue
+                                if not DRY_RUN_MODE:
+                                    try:
+                                        validate_manifest_keys(manifest)
+                                        with open(manifest_path, 'w', encoding='utf-8') as mf:
+                                            json.dump(manifest, mf, indent=4)
+                                    except (SecurityError, PermissionError) as e:
+                                        log_warn(f"Could not update manifest: {e}")
+                                log_sys("Cache updated and manifest rewritten.")
+                cleanup_counter += 1
+                if cleanup_counter % 60 == 0 and len(file_states) > 10000:
+                    current_files = set()
+                    for root, dirs, files in os.walk(target_dir):
+                        for f in files:
+                            current_files.add(os.path.join(root, f))
+                    stale_count = 0
+                    for fp in list(file_states.keys()):
+                        if fp not in current_files:
+                            del file_states[fp]
+                            stale_count += 1
+                    if stale_count:
+                        log_debug(f"Cleaned {stale_count} stale entries from watch state")
+            except OSError as e:
+                log_error("WATCH", f"File system error during watch", {"error": str(e)}, "Check disk health and permissions", exit_code=13)
+                time.sleep(5)
+                continue
             time.sleep(1)
     except KeyboardInterrupt:
         print(f"\n{C_ORANGE}Watch daemon terminated.{C_RESET}")
         sys.exit(0)
+
 
 # --- MODULE 2: SSG Cache Warmer ---
 def write_html_manifest(cache_dir, byte_size, status):
@@ -299,138 +645,218 @@ def write_html_manifest(cache_dir, byte_size, status):
         "status": status,
         "generator": "SYV-Terminal-CLI/5.0"
     }
-    with open(manifest_path, "w") as f:
-        json.dump(metadata, f, indent=4)
+    try:
+        with open(manifest_path, "w", encoding='utf-8') as f:
+            json.dump(metadata, f, indent=4)
+    except PermissionError as e:
+        log_error("CACHE", f"Cannot write cache manifest (permission denied)", {"path": manifest_path, "error": str(e)}, f"chmod +w {cache_dir}", exit_code=13)
+    except OSError as e:
+        log_error("CACHE", f"Cannot write cache manifest", {"path": manifest_path, "error": str(e)}, "Check disk space", exit_code=13)
 
 def is_cache_stale(cache_dir):
     manifest_path = os.path.join(cache_dir, "manifest.json")
     index_path = os.path.join(cache_dir, "index.html")
-
     if not os.path.exists(manifest_path) or not os.path.exists(index_path):
-        return True 
-
+        return True
     try:
-        with open(manifest_path, 'r') as f:
+        with open(manifest_path, 'r', encoding='utf-8') as f:
             meta = json.load(f)
         generated_at = meta.get("generated_at", 0)
         ttl = CONFIG.get("ttl", 3600)
         age = int(time.time()) - generated_at
         log_debug(f"Cache age: {age}s / TTL: {ttl}s")
         return age > ttl
+    except json.JSONDecodeError as e:
+        log_warn(f"Cache manifest has invalid JSON: {e}")
+        return True
+    except PermissionError as e:
+        log_warn(f"Cannot read cache manifest: {e}")
+        return True
     except Exception as e:
         log_warn(f"Could not read cache manifest: {e}")
-        return True 
+        return True
+
+@with_retry(max_retries=3, base_delay=1, exceptions=(urllib.error.URLError, socket.timeout, ConnectionError))
+def fetch_url_with_retry(url, timeout=10):
+    req = urllib.request.Request(url, headers={'User-Agent': 'SYV-Terminal-CLI/5.0'})
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return response.read(), response.getcode()
 
 def fetch_single_route(url, base_cache_dir):
     start_time = time.time()
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'SYV-Terminal-CLI/5.0'})
-        with urllib.request.urlopen(req, timeout=5) as response:
-            html = response.read()
-            status = response.getcode()
-            
-            parsed = urlparse(url)
-            route_path = parsed.path.strip("/")
-            
-            if not route_path:
-                target_dir = base_cache_dir
-                filename = "index.html"
-            elif route_path.endswith(".html"):
-                target_dir = os.path.join(base_cache_dir, os.path.dirname(route_path))
-                filename = os.path.basename(route_path)
+        validate_url_safe(url)
+        try:
+            html, status = fetch_url_with_retry(url)
+        except urllib.error.HTTPError as e:
+            status = e.code
+            html = b""
+            if e.code == 404:
+                log_warn(f"Route not found (404): {url}")
+            elif e.code == 500:
+                log_warn(f"Server error (500): {url} - the application may be crashing")
+            elif e.code == 503:
+                log_warn(f"Service unavailable (503): {url} - server is overloaded or down for maintenance")
             else:
-                target_dir = os.path.join(base_cache_dir, route_path)
-                filename = "index.html"
-
-            if not DRY_RUN_MODE:
-                if not os.path.exists(target_dir):
-                    os.makedirs(target_dir, exist_ok=True)
-                with open(os.path.join(target_dir, filename), "wb") as f:
+                log_warn(f"HTTP {e.code} for {url}")
+        except urllib.error.URLError as e:
+            reason = e.reason
+            if isinstance(reason, ConnectionRefusedError):
+                raise SYVConnectionRefusedError(f"Connection refused for {url}", target=url, recovery="Start the local server or check if port is correct")
+            elif isinstance(reason, socket.timeout) or isinstance(reason, TimeoutError):
+                raise SYVNetworkTimeoutError(f"Connection timed out for {url}", target=url, recovery="Check server load or increase timeout")
+            else:
+                raise NetworkError(f"Network error for {url}: {reason}", target=url, recovery="Check network connectivity and DNS resolution")
+        except socket.timeout:
+            raise SYVNetworkTimeoutError(f"Connection timed out for {url}", target=url, recovery="Check server load or increase timeout")
+        except TimeoutError:
+            raise SYVNetworkTimeoutError(f"Connection timed out for {url}", target=url, recovery="Check server load or increase timeout")
+        parsed = urlparse(url)
+        route_path = parsed.path.strip("/")
+        if not route_path:
+            target_dir = base_cache_dir
+            filename = "index.html"
+        elif route_path.endswith(".html"):
+            target_dir = os.path.join(base_cache_dir, os.path.dirname(route_path))
+            filename = os.path.basename(route_path)
+        else:
+            target_dir = os.path.join(base_cache_dir, route_path)
+            filename = "index.html"
+        if not DRY_RUN_MODE:
+            try:
+                validate_directory_writable(target_dir)
+            except (FileSystemError, SecurityError) as e:
+                log_warn(e.formatted())
+                return len(html) if html else 0, status if status else 500
+            filepath = os.path.join(target_dir, filename)
+            try:
+                if os.path.islink(filepath):
+                    raise SecurityError(f"Refusing to write to symlink target: {filepath}", target=filepath, recovery="Remove the symlink and retry")
+                with open(filepath, "wb") as f:
                     f.write(html)
-                    
-            log_debug(f"Scraped {url} -> {filename} in {(time.time() - start_time)*1000:.2f}ms")
-            return len(html), status
+            except SecurityError as e:
+                log_warn(e.formatted())
+                return 0, 500
+            except PermissionError as e:
+                log_error("SCRAPE", f"Cannot write cache file (permission denied)", {"path": filepath, "error": str(e)}, f"chmod +w {target_dir}", exit_code=13)
+                return 0, 500
+            except OSError as e:
+                if e.errno == errno.ENOSPC:
+                    log_error("SCRAPE", f"Disk full", {"path": filepath}, "Free up disk space", exit_code=13)
+                else:
+                    log_error("SCRAPE", f"Cannot write cache file", {"path": filepath, "error": str(e)}, "Check disk space and permissions", exit_code=13)
+                return 0, 500
+        log_debug(f"Scraped {url} -> {filename} in {(time.time() - start_time)*1000:.2f}ms")
+        return len(html) if html else 0, status if status else 200
+    except SYVException as e:
+        log_error(type(e).__name__.upper(), str(e), {"url": url}, e.recovery, e.exit_code)
+        return 0, 500
     except Exception as e:
-        log_warn(f"Failed to scrape {url}: {e}")
+        log_error("SCRAPE", f"Unexpected error scraping {url}", {"error": str(e)}, "Check the target server and network connectivity", exit_code=1)
         return 0, 500
 
 def scrape_localhost(port, is_forced):
     base_url = f"http://127.0.0.1:{port}"
     cache_dir = os.path.abspath("./syv_cache")
-
     if not is_forced and not is_cache_stale(cache_dir):
         log_sys(f"Cache is still fresh. Skipping rebuild. (Use 'force run update' to override)")
         return
-
     log_sys(f"{'FORCE OVERRIDE: ' if is_forced else ''}Warming HTML protocol for: {base_url}")
     t_start = time.time()
-
     urls_to_scrape = [base_url]
-    
-    # Sitemap Discovery (Multi-page SSG)
     try:
         sitemap_url = f"{base_url}/sitemap.xml"
-        req = urllib.request.Request(sitemap_url, headers={'User-Agent': 'SYV-Terminal-CLI/5.0'})
-        with urllib.request.urlopen(req, timeout=3) as response:
-            sitemap_data = response.read().decode('utf-8')
-            # Zero-dependency regex extraction to avoid XML namespace hell
-            locs = re.findall(r'<loc>(.*?)</loc>', sitemap_data)
-            if locs:
-                urls_to_scrape = locs
-                log_info(f"Sitemap.xml detected. Found {len(urls_to_scrape)} routes to render.")
+        try:
+            sitemap_data, sitemap_status = fetch_url_with_retry(sitemap_url, timeout=5)
+            if sitemap_status == 200:
+                try:
+                    sitemap_text = sitemap_data.decode('utf-8')
+                    locs = re.findall(r'<loc>(.*?)</loc>', sitemap_text)
+                    if locs:
+                        urls_to_scrape = [loc.strip() for loc in locs]
+                        log_info(f"Sitemap.xml detected. Found {len(urls_to_scrape)} routes to render.")
+                    else:
+                        log_debug("Sitemap.xml found but no <loc> entries detected.")
+                except UnicodeDecodeError:
+                    log_debug("Sitemap.xml has non-UTF-8 encoding. Trying latin-1 fallback.")
+                    try:
+                        sitemap_text = sitemap_data.decode('latin-1')
+                        locs = re.findall(r'<loc>(.*?)</loc>', sitemap_text)
+                        if locs:
+                            urls_to_scrape = [loc.strip() for loc in locs]
+                            log_info(f"Sitemap.xml detected. Found {len(urls_to_scrape)} routes to render.")
+                    except Exception:
+                        log_debug("Could not decode sitemap.xml. Defaulting to single-page / route.")
+            else:
+                log_debug(f"Sitemap.xml returned HTTP {sitemap_status}. Defaulting to single-page / route.")
+        except (urllib.error.HTTPError, urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError):
+            log_debug("No sitemap.xml found. Defaulting to single-page / route.")
     except Exception:
         log_debug("No sitemap.xml found. Defaulting to single-page / route.")
-
     total_bytes = 0
     total_urls = len(urls_to_scrape)
     completed = 0
     successful_pages = 0
-    optimal_threads = os.cpu_count() or 4
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_threads) as executor:
-        future_to_url = {executor.submit(fetch_single_route, url, cache_dir): url for url in urls_to_scrape}
-        print_progress(0, total_urls, prefix="Scraping")
-        for future in concurrent.futures.as_completed(future_to_url):
-            try:
-                b_size, status = future.result()
-                if status == 200:
-                    successful_pages += 1
-                total_bytes += b_size
-                completed += 1
-                print_progress(completed, total_urls, prefix="Scraping")
-            except Exception as exc:
-                sys.stdout.write(f"\n{C_ORANGE}[!] Thread exception: {exc}{C_RESET}\n")
-
+    cpu_count = os.cpu_count() or 4
+    optimal_threads = min(cpu_count, 16)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_threads) as executor:
+            future_to_url = {executor.submit(fetch_single_route, url, cache_dir): url for url in urls_to_scrape}
+            print_progress(0, total_urls, prefix="Scraping")
+            for future in concurrent.futures.as_completed(future_to_url):
+                try:
+                    b_size, status = future.result()
+                    if status == 200:
+                        successful_pages += 1
+                    total_bytes += b_size
+                    completed += 1
+                    print_progress(completed, total_urls, prefix="Scraping")
+                except Exception as exc:
+                    log_error("SCRAPE", f"Thread failed", {"url": future_to_url.get(future, "unknown"), "error": str(exc)}, "", exit_code=1)
+    except MemoryError:
+        log_error("SCRAPE", "Out of memory - too many concurrent requests", {"threads": optimal_threads, "urls": total_urls}, "Reduce thread count or process fewer URLs", exit_code=8)
+        log_sys("Falling back to sequential scraping...")
+        for url in urls_to_scrape:
+            b_size, status = fetch_single_route(url, cache_dir)
+            if status == 200:
+                successful_pages += 1
+            total_bytes += b_size
+            completed += 1
+            print_progress(completed, total_urls, prefix="Scraping")
     if successful_pages == 0 and total_urls > 0 and not DRY_RUN_MODE:
-        log_warn("SSG Protocol Failed: All requested routes returned errors (e.g. 404/500).")
+        log_error("SCRAPE", "All requested routes returned errors (404/500)", {"total_urls": total_urls, "cache_dir": cache_dir}, "Ensure the target server is running and routes are valid", exit_code=3)
         sys.exit(1)
-
     if not DRY_RUN_MODE and total_bytes > 0:
         write_html_manifest(cache_dir, total_bytes, 200)
-
     log_info(f"SSG Protocol Complete. Cached {successful_pages}/{total_urls} pages ({total_bytes / 1024:.2f} KB) in {time.time() - t_start:.2f}s")
+
 
 # --- Router Logic ---
 def extract_port(args):
     port = CONFIG.get("port", 8080)
+    raw_port_str = None
     if "--port" in args:
         idx = args.index("--port")
         if idx + 1 < len(args):
-            try:
-                port = int(args[idx + 1])
-            except ValueError:
-                log_warn(f"Invalid port value: '{args[idx + 1]}'. Using default.")
+            raw_port_str = args[idx + 1]
     elif "-p" in args:
         idx = args.index("-p")
         if idx + 1 < len(args):
-            try:
-                port = int(args[idx + 1])
-            except ValueError:
-                log_warn(f"Invalid port value: '{args[idx + 1]}'. Using default.")
+            raw_port_str = args[idx + 1]
+    if raw_port_str is not None:
+        try:
+            port = int(raw_port_str)
+        except ValueError:
+            log_error("CONFIG", f"Invalid port value: '{raw_port_str}'", {"port": raw_port_str, "type": type(raw_port_str).__name__}, "Specify a valid integer port (e.g., --port 8080)", exit_code=2)
+            return port
+        try:
+            validate_port(port)
+        except ConfigError as e:
+            log_warn(e.formatted())
     return port
 
 def print_help():
-    print(f"\n{C_GREEN}SYV / UNIFIED OPTIMIZATION DAEMON v5.0 Ultimate{C_RESET}")
+    print(f"\n{C_GREEN}SYV / UNIFIED OPTIMIZATION DAEMON v5.1{C_RESET}")
     print("Usage: syv [COMMAND] [OPTIONS]\n")
     print("Commands:")
     print("  init                  Generate a default syv.json configuration.")
@@ -448,26 +874,20 @@ def print_help():
 def main():
     global DEBUG_MODE, DRY_RUN_MODE
     args = sys.argv[1:]
-
     if "--debug" in args:
         DEBUG_MODE = True
         args.remove("--debug")
         log_debug("Debug mode engaged. Verbose logging enabled.")
-        
     if "--dry-run" in args:
         DRY_RUN_MODE = True
         args.remove("--dry-run")
         log_sys("DRY-RUN MODE ENGAGED: No files will be modified.")
-
     load_config()
-
     if not args or args[0] in ["help", "-h", "--help"]:
         print_help()
         sys.exit(0)
-
     command = args[0]
     port = extract_port(args)
-
     try:
         if command == "init":
             sys_init()
@@ -486,13 +906,16 @@ def main():
         else:
             log_warn(f"Unrecognized command '{' '.join(args)}'.")
             print_help()
-            sys.exit(1) # Proper exit code for command error
+            sys.exit(1)
     except KeyboardInterrupt:
         print(f"\n{C_ORANGE}Execution interrupted.{C_RESET}")
         sys.exit(0)
+    except SYVException as e:
+        log_error(type(e).__name__.upper(), str(e), {"target": e.target, "details": e.details} if e.details else {"target": e.target} if e.target else None, e.recovery, e.exit_code)
+        sys.exit(e.exit_code)
     except Exception as e:
-        log_warn(f"Fatal execution error: {e}")
-        sys.exit(1) # Proper exit code for CI/CD failure
+        log_error("FATAL", f"Unexpected execution error", {"error": str(e), "trace": traceback.format_exc()}, "Report this issue at https://github.com/kyrtstn/syv/issues", exit_code=1)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
