@@ -5,7 +5,7 @@
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)]()
 [![Security Hardened](https://img.shields.io/badge/security-SSRF%20%7C%20Traversal%20Safe-red.svg)]()
 [![Platform: Linux | macOS | Windows | Termux](https://img.shields.io/badge/platform-POSIX%20%7C%20NT-lightgrey.svg)]()
-![GitHub Repo stars](https://img.shields.io/github/stars/kyrtstn/syv?style=lightgrey)
+[![GitHub Repo stars(https://img.shields.io/github/stars/kyrtstn/syv?style=lightgrey)]()
 ![Star Check](https://www.fakestarchecker.com/api/badge/kyrtstn/syv.svg)
 
 `syv` is a hyper-lightweight, multi-threaded optimization engine designed to sit between your raw development code and your production web servers. By natively handling **Single Page Application (SPA) payload compression**, **automatic DOM cache-busting injection**, and **Static Site Generation (SSG) caching**, `syv` drastically reduces Time-To-First-Byte (TTFB) and network latency without the bloat of modern JS frameworks.
