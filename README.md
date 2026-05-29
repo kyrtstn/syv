@@ -187,6 +187,8 @@ jobs:
         run: echo "Deploying highly optimized, secure payloads..."
 ```
 
+---
+
 ## Star History
 
 <a href="https://www.star-history.com/?repos=kyrtstn%2Fsyv&type=date&legend=top-left">
