@@ -1,4 +1,4 @@
-# syv ⚡ 
+# ⚡ syv ⚡ 
 **The Zero-Dependency Optimization Daemon (v5.1 Ultimate)**
 
 [![Python 3.6+](https://img.shields.io/badge/python-3.6+-blue.svg)](https://www.python.org/downloads/)
@@ -189,7 +189,7 @@ jobs:
 
 ---
 
-## Star History
+## 📈 Star History
 
 <a href="https://www.star-history.com/?repos=kyrtstn%2Fsyv&type=date&legend=top-left">
  <picture>
