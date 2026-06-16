@@ -1,6 +1,6 @@
 # ⚡ syv
 **The Zero-Dependency Optimization Daemon (v5.1 Ultimate)**
-
+ 
 [![Python 3.6+](https://img.shields.io/badge/python-3.6+-blue.svg)](https://www.python.org/downloads/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)]()
 [![Security Hardened](https://img.shields.io/badge/security-SSRF%20%7C%20Traversal%20Safe-red.svg)]()
