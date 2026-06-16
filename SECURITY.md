@@ -14,7 +14,7 @@ We encourage all users to migrate to the `5.0.x Ultimate` architecture for the h
 | < 4.0   | :x:                | Unsupported. Please upgrade. |
 
 ## Reporting a Vulnerability
-
+ 
 Security is a core tenet of the `syv` architecture. As a daemon that handles raw file system operations (I/O) and network requests (SSG scraping), we take potential attack vectors very seriously.
 
 If you discover a vulnerability—particularly involving **Path Traversal** during file compression or **SSRF (Server-Side Request Forgery)** during the localhost scraping phase—we want to know about it immediately.
