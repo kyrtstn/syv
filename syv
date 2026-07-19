@@ -21,8 +21,8 @@ from datetime import datetime
 if hasattr(sys.stdout, 'reconfigure'):
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    except Exception:
-        pass
+    except Exception as e:
+        log_debug(f"Could not reconfigure stdout encoding: {e}")
 
 # --- Custom Exception Hierarchy ---
 class SYVException(Exception):
