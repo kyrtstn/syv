@@ -112,6 +112,11 @@ DEBUG_MODE = False
 DRY_RUN_MODE = False
 CONFIG = {"port": 8080, "ignore": ["node_modules", ".git", ".venv", "tests"], "ttl": 3600, "silent_mode": False}
 
+SYV_VERSION = "5.2"
+SYV_USER_AGENT = "SYV-Terminal-CLI/5.2"
+# v5.2: compressible text-based payloads (binary images/fonts excluded except woff)
+COMPRESSIBLE_EXTS = (".js", ".css", ".html", ".svg", ".json", ".map", ".xml", ".txt", ".woff", ".woff2")
+
 REPO_URL = "https://raw.githubusercontent.com/kyrtstn/syv/main/syv"
 
 
@@ -238,8 +243,13 @@ def validate_url_safe(url):
 
 def validate_manifest_keys(manifest):
     for key in manifest:
-        if ".." in key or key.startswith("/") or "~" in key:
-            raise SecurityError(f"Path traversal detected in manifest key: {key}", target=key, details="Manifest keys must not contain path traversal sequences", recovery="Remove '..', '/', or '~' from manifest keys")
+        # v5.2: keys are relative POSIX paths (e.g. "js/app.js"), so "/" is allowed.
+        # Still block traversal, absolute paths, home expansion and backslashes.
+        if ".." in key or key.startswith("/") or key.startswith("\\") or "~" in key or "\\" in key:
+            raise SecurityError(f"Path traversal detected in manifest key: {key}", target=key, details="Manifest keys must be relative paths without traversal sequences", recovery="Remove '..', leading '/', '~' or '\\' from manifest keys")
+        # Reject absolute / drive-letter paths (Windows)
+        if len(key) > 1 and key[1] == ":":
+            raise SecurityError(f"Absolute path detected in manifest key: {key}", target=key, details="Manifest keys must be relative paths", recovery="Use a path relative to the target directory")
     return True
 
 
@@ -370,28 +380,52 @@ def is_ignored(filepath):
             return True
     return False
 
+def manifest_key_for(filepath, target_dir):
+    # v5.2: use POSIX relative path as manifest key to avoid basename collisions.
+    try:
+        base = os.path.abspath(target_dir) if target_dir else os.getcwd()
+        rel = os.path.relpath(os.path.abspath(filepath), base)
+    except (ValueError, OSError):
+        rel = os.path.basename(filepath)
+    return rel.replace(os.sep, "/")
+
 def generate_file_hash(filepath):
     hasher = hashlib.md5()
     try:
         with open(filepath, 'rb') as afile:
-            buf = afile.read()
-            hasher.update(buf)
+            while True:
+                chunk = afile.read(8192)
+                if not chunk:
+                    break
+                hasher.update(chunk)
     except PermissionError as e:
         raise FileSystemError(f"Cannot read file (permission denied): {filepath}", target=filepath, details=str(e), recovery=f"Check file permissions: chmod 644 {filepath}")
     except OSError as e:
         raise FileSystemError(f"Cannot read file: {filepath}", target=filepath, details=str(e), recovery="Check if file exists and is accessible")
     return hasher.hexdigest()[:8]
 
-def process_single_file(filepath):
+def process_single_file(filepath, target_dir=None, old_manifest=None):
     start_time = time.time()
     try:
         validate_directory_readable(os.path.dirname(filepath) or ".")
     except (FileSystemError, SecurityError) as e:
         log_warn(e.formatted())
-        return {}, 0
+        return {}, 0, False
+    # v5.2 incremental: if .gz is newer than source and we already have a manifest
+    # entry, reuse it without re-hashing (saves CPU + IO on big trees).
+    rel_key = manifest_key_for(filepath, target_dir) if target_dir else os.path.basename(filepath)
+    gz_filepath = filepath + '.gz'
+    if old_manifest is not None and rel_key in old_manifest and not DRY_RUN_MODE:
+        try:
+            if os.path.exists(gz_filepath) and os.path.getmtime(gz_filepath) >= os.path.getmtime(filepath):
+                orig_size = os.path.getsize(filepath)
+                comp_size = os.path.getsize(gz_filepath)
+                return {rel_key: old_manifest[rel_key]}, orig_size - comp_size, True
+        except OSError:
+            pass
     file_hash = generate_file_hash(filepath)
-    filename = os.path.basename(filepath)
-    manifest_entry = {filename: f"{filename}?v={file_hash}"}
+    versioned = f"{rel_key}?v={file_hash}"
+    manifest_entry = {rel_key: versioned}
     try:
         with open(filepath, 'rb') as f_in:
             original_data = f_in.read()
@@ -400,7 +434,6 @@ def process_single_file(filepath):
         raise FileSystemError(f"Cannot read file (permission denied): {filepath}", target=filepath, details=str(e), recovery=f"chmod 644 {filepath}")
     except OSError as e:
         raise FileSystemError(f"Cannot read file: {filepath}", target=filepath, details=str(e), recovery="Check if file exists and is accessible")
-    gz_filepath = filepath + '.gz'
     compressed_size = original_size
     if not DRY_RUN_MODE:
         try:
@@ -419,8 +452,69 @@ def process_single_file(filepath):
                 raise FileSystemError(f"Disk full while writing {gz_filepath}", target=gz_filepath, details=f"Need ~{needed} bytes, only {free} available", recovery="Free up disk space or reduce file sizes")
             raise FileSystemError(f"Failed to write compressed file: {gz_filepath}", target=gz_filepath, details=str(e), recovery="Check disk space and permissions")
     saved_bytes = original_size - compressed_size
-    log_debug(f"Processed {filename} in {(time.time() - start_time)*1000:.2f}ms (Saved {saved_bytes} bytes)")
-    return manifest_entry, saved_bytes
+    log_debug(f"Processed {rel_key} in {(time.time() - start_time)*1000:.2f}ms (Saved {saved_bytes} bytes)")
+    return manifest_entry, saved_bytes, False
+
+def _is_compressible(filename):
+    lower = filename.lower()
+    if lower.endswith(".gz") or lower == "build_manifest.json":
+        return False
+    return lower.endswith(COMPRESSIBLE_EXTS)
+
+def _run_compress_batch(files_to_process, target_dir, old_manifest, prefix="Optimizing"):
+    manifest = {}
+    total_saved = 0
+    skipped = 0
+    completed = 0
+    total = len(files_to_process)
+    if total == 0:
+        return manifest, total_saved, skipped
+    cpu_count = os.cpu_count() or 4
+    optimal_threads = min(cpu_count, 16)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_threads) as executor:
+            future_to_file = {executor.submit(process_single_file, fp, target_dir, old_manifest): fp for fp in files_to_process}
+            print_progress(0, total, prefix=prefix)
+            for future in concurrent.futures.as_completed(future_to_file):
+                try:
+                    result = future.result()
+                    # v5.1 callers returned 2-tuple, v5.2 returns 3-tuple
+                    if len(result) == 3:
+                        manifest_entry, saved_bytes, was_skipped = result
+                    else:
+                        manifest_entry, saved_bytes = result
+                        was_skipped = False
+                    manifest.update(manifest_entry)
+                    total_saved += saved_bytes
+                    if was_skipped:
+                        skipped += 1
+                    completed += 1
+                    print_progress(completed, total, prefix=prefix)
+                except FileSystemError as exc:
+                    log_error("BUILD", str(exc), {"file": future_to_file[future]}, exc.recovery, exc.exit_code)
+                    completed += 1
+                    print_progress(completed, total, prefix=prefix)
+                except Exception as exc:
+                    log_error("BUILD", f"Unexpected thread failure", {"file": future_to_file.get(future, "unknown"), "error": str(exc)}, "Check file integrity and permissions", exit_code=1)
+                    completed += 1
+                    print_progress(completed, total, prefix=prefix)
+    except MemoryError:
+        log_error("BUILD", "Out of memory - too many threads or large files", {"threads": optimal_threads, "files": total}, "Reduce the number of concurrent workers or file sizes", exit_code=8)
+        log_sys("Falling back to sequential processing...")
+        for filepath in files_to_process:
+            try:
+                manifest_entry, saved_bytes, was_skipped = process_single_file(filepath, target_dir, old_manifest)
+                manifest.update(manifest_entry)
+                total_saved += saved_bytes
+                if was_skipped:
+                    skipped += 1
+                completed += 1
+                print_progress(completed, total, prefix=prefix)
+            except Exception as exc:
+                log_error("BUILD", f"Sequential processing failed", {"file": filepath, "error": str(exc)}, "", exit_code=1)
+                completed += 1
+                print_progress(completed, total, prefix=prefix)
+    return manifest, total_saved, skipped
 
 def compress_payloads(target_dir):
     log_sys(f"Scanning directory: {target_dir}")
@@ -432,53 +526,44 @@ def compress_payloads(target_dir):
     except (FileSystemError, SecurityError) as e:
         log_warn(e.formatted())
         sys.exit(1)
+    target_abs = os.path.abspath(target_dir)
+    manifest_path = os.path.join(target_abs, "build_manifest.json")
+    old_manifest = {}
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as mf:
+                loaded = json.load(mf)
+                if isinstance(loaded, dict):
+                    old_manifest = loaded
+        except (json.JSONDecodeError, PermissionError, OSError) as e:
+            log_debug(f"Could not load old manifest for incremental build: {e}")
     files_to_process = []
-    for root, dirs, files in os.walk(target_dir):
+    html_files = []
+    for root, dirs, files in os.walk(target_abs):
         dirs[:] = [d for d in dirs if not is_ignored(os.path.join(root, d))]
         for file in files:
-            if file.endswith('.js') or file.endswith('.css'):
-                files_to_process.append(os.path.join(root, file))
-    total_files = len(files_to_process)
+            if _is_compressible(file):
+                fp = os.path.join(root, file)
+                if file.lower().endswith(".html"):
+                    html_files.append(fp)
+                else:
+                    files_to_process.append(fp)
+    total_files = len(files_to_process) + len(html_files)
     if total_files == 0:
         log_warn("No target files found to compress.")
         return
-    log_info(f"Discovered {total_files} payloads. Engaging multi-core compression...")
+    log_info(f"Discovered {total_files} payloads ({len(html_files)} html). Engaging multi-core compression...")
     manifest = {}
     total_saved_bytes = 0
-    completed_files = 0
-    cpu_count = os.cpu_count() or 4
-    optimal_threads = min(cpu_count, 16)
+    total_skipped = 0
     t_start = time.time()
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_threads) as executor:
-            future_to_file = {executor.submit(process_single_file, filepath): filepath for filepath in files_to_process}
-            print_progress(0, total_files)
-            for future in concurrent.futures.as_completed(future_to_file):
-                try:
-                    manifest_entry, saved_bytes = future.result()
-                    manifest.update(manifest_entry)
-                    total_saved_bytes += saved_bytes
-                    completed_files += 1
-                    print_progress(completed_files, total_files)
-                except FileSystemError as exc:
-                    log_error("BUILD", str(exc), {"file": future_to_file[future]}, exc.recovery, exc.exit_code)
-                except Exception as exc:
-                    log_error("BUILD", f"Unexpected thread failure", {"file": future_to_file.get(future, "unknown"), "error": str(exc)}, "Check file integrity and permissions", exit_code=1)
-    except MemoryError:
-        log_error("BUILD", "Out of memory - too many threads or large files", {"threads": optimal_threads, "files": total_files}, "Reduce the number of concurrent workers or file sizes", exit_code=8)
-        if total_files > 0:
-            log_sys("Falling back to sequential processing...")
-            for filepath in files_to_process:
-                try:
-                    manifest_entry, saved_bytes = process_single_file(filepath)
-                    manifest.update(manifest_entry)
-                    total_saved_bytes += saved_bytes
-                    completed_files += 1
-                    print_progress(completed_files, total_files)
-                except Exception as exc:
-                    log_error("BUILD", f"Sequential processing failed", {"file": filepath, "error": str(exc)}, "", exit_code=1)
+    # Phase 1: assets first so DOM rewriter has fresh hashes
+    batch_manifest, batch_saved, batch_skipped = _run_compress_batch(files_to_process, target_abs, old_manifest, prefix="Optimizing")
+    manifest.update(batch_manifest)
+    total_saved_bytes += batch_saved
+    total_skipped += batch_skipped
+    # Merge untouched old entries (deleted files drop out naturally on rewrite)
     if not DRY_RUN_MODE:
-        manifest_path = os.path.join(target_dir, "build_manifest.json")
         try:
             validate_manifest_keys(manifest)
             with open(manifest_path, 'w', encoding='utf-8') as mf:
@@ -487,10 +572,26 @@ def compress_payloads(target_dir):
             log_error("BUILD", str(e), {"manifest": manifest_path}, e.recovery, e.exit_code)
         except PermissionError as e:
             log_error("BUILD", f"Cannot write manifest (permission denied)", {"path": manifest_path, "error": str(e)}, f"chmod +w {target_dir}", exit_code=13)
-        rewrite_html_dom(target_dir)
+        rewrite_html_dom(target_abs)
     else:
-        rewrite_html_dom(target_dir)
-    log_info(f"SPA Protocol Complete in {time.time() - t_start:.2f}s. Saved {total_saved_bytes / 1024 / 1024:.2f} MB.")
+        rewrite_html_dom(target_abs)
+    # Phase 2: compress rewritten HTML so .gz matches injected content
+    if html_files:
+        # Reload manifest to include DOM-stable state, keep old entries for incremental
+        combined_old = dict(old_manifest)
+        combined_old.update(manifest)
+        html_manifest, html_saved, html_skipped = _run_compress_batch(html_files, target_abs, combined_old, prefix="Compressing HTML")
+        manifest.update(html_manifest)
+        total_saved_bytes += html_saved
+        total_skipped += html_skipped
+        if not DRY_RUN_MODE:
+            try:
+                validate_manifest_keys(manifest)
+                with open(manifest_path, 'w', encoding='utf-8') as mf:
+                    json.dump(manifest, mf, indent=4)
+            except (SecurityError, PermissionError, OSError) as e:
+                log_warn(f"Could not finalize manifest after HTML pass: {e}")
+    log_info(f"SPA Protocol Complete in {time.time() - t_start:.2f}s. Saved {total_saved_bytes / 1024 / 1024:.2f} MB. Skipped {total_skipped} unchanged files.")
 
 
 # --- MODULE 1.5: DOM Rewriter ---
@@ -538,8 +639,10 @@ def rewrite_html_dom(target_dir):
                 original = content
                 for orig, vers in manifest.items():
                     safe_orig = re.escape(orig)
-                    pattern = r'((?:src|href)=["\'][^"\']*?)(' + safe_orig + r')(["\'])'
-                    content = re.sub(pattern, r'\g<1>' + vers + r'\g<3>', content)
+                    # v5.2 idempotent: match "orig" with optional stale "?v=hash" suffix
+                    # so re-running build replaces the old hash instead of stacking or going stale.
+                    pattern = r'((?:src|href)=["\'][^"\']*?)(' + safe_orig + r')(?:\?v=[a-fA-F0-9]{6,16})?(["\'])'
+                    content = re.sub(pattern, lambda m, v=vers: m.group(1) + v + m.group(3), content)
                 if content != original:
                     if not DRY_RUN_MODE:
                         try:
@@ -567,56 +670,65 @@ def watch_payloads(target_dir):
     except (FileSystemError, SecurityError) as e:
         log_warn(e.formatted())
         sys.exit(1)
+    target_abs = os.path.abspath(target_dir)
     file_states = {}
     MAX_WATCHED_FILES = 100000
-    manifest_path = os.path.join(target_dir, "build_manifest.json")
+    manifest_path = os.path.join(target_abs, "build_manifest.json")
     manifest = {}
     cleanup_counter = 0
     if os.path.exists(manifest_path) and not DRY_RUN_MODE:
         try:
             with open(manifest_path, 'r', encoding='utf-8') as mf:
-                manifest = json.load(mf)
+                loaded = json.load(mf)
+                if isinstance(loaded, dict):
+                    manifest = loaded
         except (json.JSONDecodeError, PermissionError) as e:
             log_warn(f"Could not load existing manifest: {e}")
     log_info("Watching for file changes... (Press Ctrl+C to exit)")
     try:
         while True:
             try:
-                for root, dirs, files in os.walk(target_dir):
+                for root, dirs, files in os.walk(target_abs):
                     dirs[:] = [d for d in dirs if not is_ignored(os.path.join(root, d))]
                     for file in files:
-                        if file.endswith('.js') or file.endswith('.css'):
-                            filepath = os.path.join(root, file)
-                            try:
-                                mtime = os.path.getmtime(filepath)
-                            except OSError:
+                        # v5.2: watch compressible assets; skip .html to avoid
+                        # rewrite-triggered loops (run `syv build` for DOM injection).
+                        if file.lower().endswith(".html"):
+                            continue
+                        if not _is_compressible(file):
+                            continue
+                        filepath = os.path.join(root, file)
+                        try:
+                            mtime = os.path.getmtime(filepath)
+                        except OSError:
+                            continue
+                        if filepath not in file_states:
+                            if len(file_states) >= MAX_WATCHED_FILES:
+                                log_warn(f"Watch limit reached ({MAX_WATCHED_FILES} files).")
                                 continue
-                            if filepath not in file_states:
-                                if len(file_states) >= MAX_WATCHED_FILES:
-                                    log_warn(f"Watch limit reached ({MAX_WATCHED_FILES} files).")
-                                    continue
-                                file_states[filepath] = mtime
-                            elif file_states[filepath] < mtime:
-                                log_info(f"Change detected: {file}")
-                                file_states[filepath] = mtime
+                            file_states[filepath] = mtime
+                        elif file_states[filepath] < mtime:
+                            log_info(f"Change detected: {file}")
+                            file_states[filepath] = mtime
+                            try:
+                                res = process_single_file(filepath, target_abs, manifest)
+                                manifest_entry = res[0] if len(res) == 3 else res[0]
+                                manifest.update(manifest_entry)
+                            except (FileSystemError, OSError) as e:
+                                log_error("WATCH", f"Failed to process changed file", {"file": filepath, "error": str(e)}, "Check file permissions", exit_code=13)
+                                continue
+                            if not DRY_RUN_MODE:
                                 try:
-                                    manifest_entry, _ = process_single_file(filepath)
-                                    manifest.update(manifest_entry)
-                                except (FileSystemError, OSError) as e:
-                                    log_error("WATCH", f"Failed to process changed file", {"file": filepath, "error": str(e)}, "Check file permissions", exit_code=13)
-                                    continue
-                                if not DRY_RUN_MODE:
-                                    try:
-                                        validate_manifest_keys(manifest)
-                                        with open(manifest_path, 'w', encoding='utf-8') as mf:
-                                            json.dump(manifest, mf, indent=4)
-                                    except (SecurityError, PermissionError) as e:
-                                        log_warn(f"Could not update manifest: {e}")
-                                log_sys("Cache updated and manifest rewritten.")
+                                    validate_manifest_keys(manifest)
+                                    with open(manifest_path, 'w', encoding='utf-8') as mf:
+                                        json.dump(manifest, mf, indent=4)
+                                except (SecurityError, PermissionError) as e:
+                                    log_warn(f"Could not update manifest: {e}")
+                            log_sys("Cache updated and manifest rewritten.")
                 cleanup_counter += 1
                 if cleanup_counter % 60 == 0 and len(file_states) > 10000:
                     current_files = set()
-                    for root, dirs, files in os.walk(target_dir):
+                    for root, dirs, files in os.walk(target_abs):
                         for f in files:
                             current_files.add(os.path.join(root, f))
                     stale_count = 0
@@ -643,7 +755,7 @@ def write_html_manifest(cache_dir, byte_size, status):
         "generated_at": int(time.time()),
         "byte_size": byte_size,
         "status": status,
-        "generator": "SYV-Terminal-CLI/5.0"
+        "generator": SYV_USER_AGENT
     }
     try:
         with open(manifest_path, "w", encoding='utf-8') as f:
@@ -678,7 +790,7 @@ def is_cache_stale(cache_dir):
 
 @with_retry(max_retries=3, base_delay=1, exceptions=(urllib.error.URLError, socket.timeout, ConnectionError))
 def fetch_url_with_retry(url, timeout=10):
-    req = urllib.request.Request(url, headers={'User-Agent': 'SYV-Terminal-CLI/5.0'})
+    req = urllib.request.Request(url, headers={'User-Agent': SYV_USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return response.read(), response.getcode()
 
@@ -831,6 +943,189 @@ def scrape_localhost(port, is_forced):
     log_info(f"SSG Protocol Complete. Cached {successful_pages}/{total_urls} pages ({total_bytes / 1024:.2f} KB) in {time.time() - t_start:.2f}s")
 
 
+# --- MODULE 3: Gzip-aware Static Server (v5.2) ---
+def serve_directory(target_dir, port):
+    import mimetypes
+    try:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+    except ImportError as e:
+        log_error("SERVE", "http.server is unavailable", {"error": str(e)}, "Use Python 3.6+", exit_code=1)
+        sys.exit(1)
+    try:
+        from http.server import ThreadingHTTPServer as _ThreadedServer
+    except ImportError:
+        import socketserver
+        class _ThreadedServer(socketserver.ThreadingMixIn, HTTPServer):
+            daemon_threads = True
+    if not os.path.isdir(target_dir):
+        log_error("SERVE", f"Directory not found: {target_dir}", recovery=f"Run syv build first or specify a valid dir: syv serve ./dist -p {port}", exit_code=1)
+        sys.exit(1)
+    try:
+        validate_port(port)
+    except ConfigError as e:
+        log_warn(e.formatted())
+        sys.exit(2)
+    root = os.path.abspath(target_dir)
+
+    class GzipHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            if not CONFIG.get("silent_mode", False):
+                sys.stdout.write(f"{C_DARK_GREY}[serve]{C_RESET} {self.address_string()} {fmt % args}\n")
+
+        def _serve_path(self):
+            # Strip query string, normalize, block traversal
+            raw = self.path.split("?", 1)[0].split("#", 1)[0]
+            # urllib parse unquote via stdlib without extra import
+            try:
+                from urllib.parse import unquote
+                raw = unquote(raw)
+            except Exception:
+                pass
+            rel = raw.lstrip("/").replace("/", os.sep)
+            if ".." in rel.split(os.sep) or rel.startswith("~"):
+                self.send_error(403, "Forbidden")
+                return
+            full = os.path.abspath(os.path.join(root, rel))
+            if not full.startswith(root):
+                self.send_error(403, "Forbidden")
+                return
+            if os.path.isdir(full):
+                full = os.path.join(full, "index.html")
+            if not os.path.isfile(full):
+                self.send_error(404, "Not Found")
+                return
+            # Gzip negotiation: serve .gz if client accepts it
+            accept = self.headers.get("Accept-Encoding", "")
+            gz_path = full + ".gz"
+            use_gz = "gzip" in accept and os.path.isfile(gz_path)
+            serve_path = gz_path if use_gz else full
+            ctype, _ = mimetypes.guess_type(full)
+            try:
+                with open(serve_path, "rb") as f:
+                    data = f.read()
+            except OSError as e:
+                self.send_error(500, str(e))
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", ctype or "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            if use_gz:
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Vary", "Accept-Encoding")
+            self.end_headers()
+            if self.command != "HEAD":
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        def do_GET(self):
+            self._serve_path()
+
+        def do_HEAD(self):
+            self._serve_path()
+
+    try:
+        httpd = _ThreadedServer(("127.0.0.1", port), GzipHandler)
+    except PermissionError as e:
+        log_error("SERVE", f"Cannot bind port {port} (permission denied)", {"error": str(e)}, f"Use a port >= 1024 or free the port", exit_code=13)
+        sys.exit(13)
+    except OSError as e:
+        log_error("SERVE", f"Cannot bind port {port}", {"error": str(e)}, "Free the port or pick another with -p", exit_code=1)
+        sys.exit(1)
+    log_info(f"Serving '{root}' on http://127.0.0.1:{port} (gzip-aware). Ctrl+C to stop.")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print(f"\n{C_ORANGE}Server stopped.{C_RESET}")
+    finally:
+        try:
+            httpd.server_close()
+        except Exception:
+            pass
+
+
+# --- MODULE 4: Build Stats Reporter (v5.2) ---
+def stats_directory(target_dir):
+    target_abs = os.path.abspath(target_dir)
+    if not os.path.isdir(target_abs):
+        log_error("STATS", f"Directory not found: {target_abs}", recovery=f"Specify a valid dir: syv stats ./dist", exit_code=1)
+        sys.exit(1)
+    manifest_path = os.path.join(target_abs, "build_manifest.json")
+    manifest_count = 0
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as mf:
+                loaded = json.load(mf)
+                if isinstance(loaded, dict):
+                    manifest_count = len(loaded)
+        except (json.JSONDecodeError, OSError):
+            pass
+    rows = []
+    total_orig = 0
+    total_comp = 0
+    gz_count = 0
+    for root, dirs, files in os.walk(target_abs):
+        dirs[:] = [d for d in dirs if not is_ignored(os.path.join(root, d))]
+        for file in files:
+            if file.endswith(".gz") or file == "build_manifest.json":
+                continue
+            if not _is_compressible(file):
+                continue
+            fp = os.path.join(root, file)
+            gz = fp + ".gz"
+            try:
+                orig = os.path.getsize(fp)
+            except OSError:
+                continue
+            comp = orig
+            if os.path.exists(gz):
+                try:
+                    comp = os.path.getsize(gz)
+                    gz_count += 1
+                except OSError:
+                    pass
+            saved = orig - comp
+            total_orig += orig
+            total_comp += comp
+            try:
+                rel = os.path.relpath(fp, target_abs).replace(os.sep, "/")
+            except (ValueError, OSError):
+                rel = file
+            rows.append((rel, orig, comp, saved))
+    rows.sort(key=lambda r: r[3], reverse=True)
+    saved_total = total_orig - total_comp
+    ratio = (saved_total / total_orig * 100.0) if total_orig else 0.0
+    # syv_cache size
+    cache_dir = os.path.abspath("./syv_cache")
+    cache_kb = 0.0
+    cache_pages = 0
+    if os.path.isdir(cache_dir):
+        for r, _, fs in os.walk(cache_dir):
+            for f in fs:
+                try:
+                    cache_kb += os.path.getsize(os.path.join(r, f))
+                    if f.endswith(".html"):
+                        cache_pages += 1
+                except OSError:
+                    continue
+        cache_kb = cache_kb / 1024.0
+    print(f"\n{C_GREEN}SYV BUILD STATS v{SYV_VERSION}{C_RESET}  {C_DARK_GREY}{target_abs}{C_RESET}")
+    print(f"  Files: {len(rows)} tracked | .gz: {gz_count} | manifest: {manifest_count} entries")
+    if total_orig:
+        print(f"  Original: {total_orig/1024/1024:.2f} MB  ->  Compressed: {total_comp/1024/1024:.2f} MB  |  Saved: {saved_total/1024/1024:.2f} MB ({ratio:.1f}%)")
+    else:
+        print("  No compressible files found. Run `syv build` first.")
+    if rows:
+        print(f"\n  Top {min(10, len(rows))} savings:")
+        for rel, orig, comp, saved in rows[:10]:
+            pct = (saved / orig * 100.0) if orig else 0.0
+            print(f"    {C_CYAN}{rel}{C_RESET}  {orig/1024:.1f} KB -> {comp/1024:.1f} KB  (saved {saved/1024:.1f} KB, {pct:.0f}%)")
+    if os.path.isdir(cache_dir):
+        print(f"\n  SSG cache: {cache_pages} pages, {cache_kb:.1f} KB in ./syv_cache/")
+    print("")
+
+
 # --- Router Logic ---
 def extract_port(args):
     port = CONFIG.get("port", 8080)
@@ -856,18 +1151,21 @@ def extract_port(args):
     return port
 
 def print_help():
-    print(f"\n{C_GREEN}SYV / UNIFIED OPTIMIZATION DAEMON v5.1{C_RESET}")
+    print(f"\n{C_GREEN}SYV / UNIFIED OPTIMIZATION DAEMON v{SYV_VERSION}{C_RESET}")
     print("Usage: syv [COMMAND] [OPTIONS]\n")
     print("Commands:")
     print("  init                  Generate a default syv.json configuration.")
     print("  start                 Initialize the system daemon.")
-    print("  build [dir]           Multi-thread compress & hash JS/CSS payloads.")
+    print("  build [dir]           Multi-thread compress & hash payloads (incremental).")
     print("  watch [dir]           Live-monitor [dir] and recompile on file save.")
+    print("  serve [dir]           Serve [dir] on localhost with gzip negotiation.")
+    print("  stats [dir]           Show compression savings + cache report.")
+    print("  version               Print syv version.")
     print("  clean [dir]           Purge all .gz files, manifests, and syv_cache.")
     print("  run update            Scrape localhost (and sitemap.xml) to generate SSG cache.")
     print("  force run update      Bypass TTL and force a complete HTML rebuild.\n")
     print("Options:")
-    print("  -p, --port <number>   Target localhost port.")
+    print("  -p, --port <number>   Target localhost port (serve + run update).")
     print("  --debug               Enable verbose millisecond execution logging.")
     print("  --dry-run             Simulate actions without writing/deleting any files.\n")
 
@@ -893,12 +1191,31 @@ def main():
             sys_init()
         elif command == "start":
             sys_start()
+        elif command in ("version", "--version", "-v"):
+            print(f"syv v{SYV_VERSION}")
         elif command == "clean":
             clean_system(args[1] if len(args) > 1 else "./dist")
         elif command == "build":
             compress_payloads(args[1] if len(args) > 1 else "./dist")
         elif command == "watch":
             watch_payloads(args[1] if len(args) > 1 else "./dist")
+        elif command == "serve":
+            # syv serve [dir] [-p port]
+            serve_dir = "./dist"
+            skip_next = False
+            for a in args[1:]:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if a in ("-p", "--port"):
+                    skip_next = True
+                    continue
+                if not a.startswith("-"):
+                    serve_dir = a
+                    break
+            serve_directory(serve_dir, port)
+        elif command == "stats":
+            stats_directory(args[1] if len(args) > 1 and not args[1].startswith("-") else "./dist")
         elif command == "force" and len(args) >= 3 and args[1] == "run" and args[2] == "update":
             scrape_localhost(port, is_forced=True)
         elif command == "run" and len(args) >= 2 and args[1] == "update":
