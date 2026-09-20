@@ -8,5 +8,13 @@
     "syv_cache"
   ],
   "ttl": 3600,
-  "silent_mode": false
+  "silent_mode": false,
+  "workers": 0,
+  "gzip_level": 9,
+  "include": [],
+  "exclude": [],
+  "timeout": 10,
+  "headers": {},
+  "allowlist": [],
+  "log_file": null
 }

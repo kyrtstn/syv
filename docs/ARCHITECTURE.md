@@ -1,14 +1,16 @@
-# System Architecture: syv (Unified Optimization Daemon) v5.1 Ultimate
+# System Architecture: syv (Unified Optimization Daemon) v5.3
 
 ## 1. High-Level System Overview
 `syv` is a zero-dependency, multi-threaded optimization daemon and static asset compiler. Written entirely in standard Python 3, it acts as a high-performance middleware layer bridging raw development environments and production web servers.
 
-The v5.1 Ultimate architecture transitions the tool from a local development script into an enterprise-grade CI/CD utility. The engine is divided into five primary execution domains:
-1. **Global Configuration & Safety State:** Dynamic runtime configuration, dry-run simulation, and strict POSIX exit codes.
-2. **SPA Compiler (Multi-Threaded):** High-throughput, CPU-bound compression and hashing pipeline.
-3. **DOM Rewriter:** Zero-dependency, Regex-based HTML injection engine for automatic cache-busting.
-4. **SSG Scraper (Network IO & Discovery):** Concurrent multi-page HTML caching engine with automated `sitemap.xml` discovery.
-5. **Lifecycle Management:** Automated workspace initialization and artifact purging.
+The v5.3 architecture adds a CI consistency gate (`syv check`), debounced watch with deleted-file pruning, and an allowlisted multi-source scraper (sitemap.xml / sitemapindex / robots.txt). The engine is divided into seven primary execution domains:
+1. **Global Configuration & Safety State:** Dynamic runtime configuration (workers, gzip_level, include/exclude, timeout, headers, allowlist, log_file), dry-run simulation, and strict POSIX exit codes.
+2. **SPA Compiler (Multi-Threaded, Incremental):** High-throughput, CPU-bound compression and hashing pipeline with `.gz`-mtime skip.
+3. **DOM Rewriter:** Zero-dependency, Regex-based HTML injection engine for automatic cache-busting (idempotent, relative-path manifest).
+4. **SSG Scraper (Network IO & Discovery):** Concurrent multi-page HTML caching engine with automated `sitemap.xml` / `sitemapindex` / `robots.txt` discovery and per-route failure reporting.
+5. **Consistency Gate (`syv check`):** Manifest + `.gz` + HTML hash verification with human and `--json` output for CI.
+6. **Dev Server & Stats:** Gzip-aware `serve` and size-reporting `stats`.
+7. **Lifecycle Management:** Automated workspace initialization and artifact purging.
 
 ---
 

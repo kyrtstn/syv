@@ -1,0 +1,28 @@
+name: syv CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Unit tests (stdlib only)
+        run: python -m unittest discover -s tests -v
+      - name: Sandbox build + check
+        run: |
+          mkdir -p ci_dist/js ci_dist/css
+          echo "console.log('ci');" > ci_dist/js/app.js
+          echo "body{color:blue}" > ci_dist/css/s.css
+          echo "<script src=\"js/app.js\"></script>" > ci_dist/index.html
+          python syv build ./ci_dist
+          python syv check ./ci_dist
+          python syv stats ./ci_dist

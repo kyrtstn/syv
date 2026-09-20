@@ -13,6 +13,7 @@ import re
 import errno
 import traceback
 import socket
+import fnmatch
 from urllib.parse import urlparse
 from datetime import datetime
 
@@ -110,10 +111,12 @@ C_MAGENTA = '\033[95m'
 
 DEBUG_MODE = False
 DRY_RUN_MODE = False
-CONFIG = {"port": 8080, "ignore": ["node_modules", ".git", ".venv", "tests"], "ttl": 3600, "silent_mode": False}
+CONFIG = {"port": 8080, "ignore": ["node_modules", ".git", ".venv", "tests"], "ttl": 3600, "silent_mode": False,
+          "workers": 0, "gzip_level": 9, "include": [], "exclude": [], "timeout": 10,
+          "headers": {}, "allowlist": [], "log_file": None}
 
-SYV_VERSION = "5.2"
-SYV_USER_AGENT = "SYV-Terminal-CLI/5.2"
+SYV_VERSION = "5.3"
+SYV_USER_AGENT = "SYV-Terminal-CLI/5.3"
 # v5.2: compressible text-based payloads (binary images/fonts excluded except woff)
 COMPRESSIBLE_EXTS = (".js", ".css", ".html", ".svg", ".json", ".map", ".xml", ".txt", ".woff", ".woff2")
 
@@ -190,6 +193,35 @@ def validate_config(config):
         errors.append(ConfigError(f"ignore must be a list, got {type(ignore).__name__}", target="ignore", recovery="Set ignore to a list of directory names"))
     elif not all(isinstance(i, str) for i in ignore):
         errors.append(ConfigError(f"Each ignore pattern must be a string", target="ignore", recovery="Ensure all entries in ignore are strings"))
+    workers = config.get("workers", 0)
+    if not isinstance(workers, int):
+        errors.append(ConfigError(f"workers must be an integer, got {type(workers).__name__}", target="workers", recovery="Set workers to 0 (auto) or 1-32"))
+    elif workers < 0 or workers > 32:
+        errors.append(ConfigError(f"workers {workers} out of range (0-32)", target="workers", recovery="Use 0 for auto or 1-32"))
+    gzip_level = config.get("gzip_level", 9)
+    if not isinstance(gzip_level, int):
+        errors.append(ConfigError(f"gzip_level must be an integer, got {type(gzip_level).__name__}", target="gzip_level", recovery="Set gzip_level to 1-9"))
+    elif gzip_level < 1 or gzip_level > 9:
+        errors.append(ConfigError(f"gzip_level {gzip_level} out of range (1-9)", target="gzip_level", recovery="Use 1 (fast) to 9 (max)"))
+    for list_key in ("include", "exclude", "allowlist"):
+        val = config.get(list_key, [])
+        if not isinstance(val, list):
+            errors.append(ConfigError(f"{list_key} must be a list, got {type(val).__name__}", target=list_key, recovery=f"Set {list_key} to a list of strings"))
+        elif not all(isinstance(i, str) for i in val):
+            errors.append(ConfigError(f"Each {list_key} pattern must be a string", target=list_key, recovery=f"Ensure all entries in {list_key} are strings"))
+    timeout = config.get("timeout", 10)
+    if not isinstance(timeout, int):
+        errors.append(ConfigError(f"timeout must be an integer, got {type(timeout).__name__}", target="timeout", recovery="Set timeout to seconds (e.g., 10)"))
+    elif timeout < 1 or timeout > 120:
+        errors.append(ConfigError(f"timeout {timeout} out of range (1-120)", target="timeout", recovery="Use 1-120 seconds"))
+    headers = config.get("headers", {})
+    if not isinstance(headers, dict):
+        errors.append(ConfigError(f"headers must be an object, got {type(headers).__name__}", target="headers", recovery='Set headers to {"Authorization": "Bearer ..."}'))
+    elif not all(isinstance(k, str) and isinstance(v, str) for k, v in headers.items()):
+        errors.append(ConfigError("Each header name/value must be a string", target="headers", recovery="Use string header names and values"))
+    log_file = config.get("log_file", None)
+    if log_file is not None and not isinstance(log_file, str):
+        errors.append(ConfigError(f"log_file must be a string or null, got {type(log_file).__name__}", target="log_file", recovery='Set log_file to a path or null'))
     return errors
 
 def validate_directory_readable(path):
@@ -237,9 +269,13 @@ def validate_port(port):
 def validate_url_safe(url):
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
-    if hostname not in ("127.0.0.1", "localhost", "::1"):
-        raise SYVSSRFRiskError(f"URL target is not localhost-bound: {url}", target=url, recovery="Only localhost URLs (127.0.0.1 or localhost) are allowed for security")
-    return True
+    if hostname in ("127.0.0.1", "localhost", "::1"):
+        return True
+    # v5.3: explicit allowlist for staging hosts (e.g. ["staging.internal"])
+    allowlist = CONFIG.get("allowlist", []) or []
+    if hostname in allowlist:
+        return True
+    raise SYVSSRFRiskError(f"URL target is not localhost-bound: {url}", target=url, recovery="Only localhost URLs are allowed unless the host is in syv.json allowlist")
 
 def validate_manifest_keys(manifest):
     for key in manifest:
@@ -251,6 +287,57 @@ def validate_manifest_keys(manifest):
         if len(key) > 1 and key[1] == ":":
             raise SecurityError(f"Absolute path detected in manifest key: {key}", target=key, details="Manifest keys must be relative paths", recovery="Use a path relative to the target directory")
     return True
+
+
+# --- v5.3 Config Helpers ---
+def get_workers():
+    try:
+        w = int(CONFIG.get("workers", 0) or 0)
+    except (TypeError, ValueError):
+        w = 0
+    if w <= 0:
+        cpu_count = os.cpu_count() or 4
+        return min(cpu_count, 16)
+    return min(w, 32)
+
+def get_gzip_level():
+    try:
+        lvl = int(CONFIG.get("gzip_level", 9))
+    except (TypeError, ValueError):
+        lvl = 9
+    return max(1, min(9, lvl))
+
+def get_timeout(default=10):
+    try:
+        t = int(CONFIG.get("timeout", default))
+    except (TypeError, ValueError):
+        t = default
+    return max(1, min(120, t))
+
+def get_request_headers():
+    headers = {"User-Agent": SYV_USER_AGENT}
+    extra = CONFIG.get("headers", {}) or {}
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            if isinstance(k, str) and isinstance(v, str):
+                headers[k] = v
+    return headers
+
+def _match_any_pattern(path_posix, name, patterns):
+    for pat in patterns:
+        if not pat:
+            continue
+        # Exact dir/file name, substring path, or glob on name/path
+        if pat == name:
+            return True
+        if pat in path_posix:
+            return True
+        try:
+            if fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(path_posix, pat):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 # --- Retry Logic ---
@@ -282,7 +369,8 @@ def load_config():
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
                 user_config = json.load(f)
-            allowed_keys = {"port", "ignore", "ttl", "silent_mode"}
+            allowed_keys = {"port", "ignore", "ttl", "silent_mode", "workers", "gzip_level",
+                            "include", "exclude", "timeout", "headers", "allowlist", "log_file"}
             for key in allowed_keys:
                 if key in user_config:
                     CONFIG[key] = user_config[key]
@@ -318,7 +406,15 @@ def sys_init():
         "port": 8080,
         "ignore": ["node_modules", ".git", ".venv", "tests", "syv_cache"],
         "ttl": 3600,
-        "silent_mode": False
+        "silent_mode": False,
+        "workers": 0,
+        "gzip_level": 9,
+        "include": [],
+        "exclude": [],
+        "timeout": 10,
+        "headers": {},
+        "allowlist": [],
+        "log_file": None
     }
     if not DRY_RUN_MODE:
         try:
@@ -375,10 +471,34 @@ def clean_system(target_dir):
 
 # --- MODULE 1: SPA Build Optimizer ---
 def is_ignored(filepath):
-    for ignore_pattern in CONFIG.get("ignore", []):
+    # v5.3: support exact names, substrings (back-compat) and glob patterns
+    # (*.map, dist/**) matched against basename and POSIX path.
+    name = os.path.basename(filepath)
+    posix = filepath.replace(os.sep, "/")
+    for ignore_pattern in CONFIG.get("ignore", []) or []:
+        if not ignore_pattern:
+            continue
+        if ignore_pattern == name:
+            return True
         if ignore_pattern in filepath.split(os.sep):
             return True
+        try:
+            if fnmatch.fnmatch(name, ignore_pattern) or fnmatch.fnmatch(posix, ignore_pattern):
+                return True
+        except Exception:
+            continue
     return False
+
+def should_include(filepath):
+    includes = CONFIG.get("include", []) or []
+    excludes = CONFIG.get("exclude", []) or []
+    name = os.path.basename(filepath)
+    posix = filepath.replace(os.sep, "/")
+    if excludes and _match_any_pattern(posix, name, excludes):
+        return False
+    if includes:
+        return _match_any_pattern(posix, name, includes)
+    return True
 
 def manifest_key_for(filepath, target_dir):
     # v5.2: use POSIX relative path as manifest key to avoid basename collisions.
@@ -437,7 +557,7 @@ def process_single_file(filepath, target_dir=None, old_manifest=None):
     compressed_size = original_size
     if not DRY_RUN_MODE:
         try:
-            with gzip.open(gz_filepath, 'wb') as f_out:
+            with gzip.open(gz_filepath, 'wb', compresslevel=get_gzip_level()) as f_out:
                 f_out.write(original_data)
             compressed_size = os.path.getsize(gz_filepath)
         except PermissionError as e:
@@ -461,6 +581,11 @@ def _is_compressible(filename):
         return False
     return lower.endswith(COMPRESSIBLE_EXTS)
 
+def _is_compressible_path(filepath):
+    if not _is_compressible(os.path.basename(filepath)):
+        return False
+    return should_include(filepath)
+
 def _run_compress_batch(files_to_process, target_dir, old_manifest, prefix="Optimizing"):
     manifest = {}
     total_saved = 0
@@ -469,8 +594,7 @@ def _run_compress_batch(files_to_process, target_dir, old_manifest, prefix="Opti
     total = len(files_to_process)
     if total == 0:
         return manifest, total_saved, skipped
-    cpu_count = os.cpu_count() or 4
-    optimal_threads = min(cpu_count, 16)
+    optimal_threads = get_workers()
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_threads) as executor:
             future_to_file = {executor.submit(process_single_file, fp, target_dir, old_manifest): fp for fp in files_to_process}
@@ -542,12 +666,13 @@ def compress_payloads(target_dir):
     for root, dirs, files in os.walk(target_abs):
         dirs[:] = [d for d in dirs if not is_ignored(os.path.join(root, d))]
         for file in files:
-            if _is_compressible(file):
-                fp = os.path.join(root, file)
-                if file.lower().endswith(".html"):
-                    html_files.append(fp)
-                else:
-                    files_to_process.append(fp)
+            fp = os.path.join(root, file)
+            if not _is_compressible(file) or not should_include(fp):
+                continue
+            if file.lower().endswith(".html"):
+                html_files.append(fp)
+            else:
+                files_to_process.append(fp)
     total_files = len(files_to_process) + len(html_files)
     if total_files == 0:
         log_warn("No target files found to compress.")
@@ -685,9 +810,15 @@ def watch_payloads(target_dir):
         except (json.JSONDecodeError, PermissionError) as e:
             log_warn(f"Could not load existing manifest: {e}")
     log_info("Watching for file changes... (Press Ctrl+C to exit)")
+    file_states = dict(file_states)
+    pending = {}
+    DEBOUNCE_SEC = 0.8
     try:
         while True:
             try:
+                now = time.time()
+                current_set = set()
+                manifest_dirty = False
                 for root, dirs, files in os.walk(target_abs):
                     dirs[:] = [d for d in dirs if not is_ignored(os.path.join(root, d))]
                     for file in files:
@@ -695,9 +826,10 @@ def watch_payloads(target_dir):
                         # rewrite-triggered loops (run `syv build` for DOM injection).
                         if file.lower().endswith(".html"):
                             continue
-                        if not _is_compressible(file):
-                            continue
                         filepath = os.path.join(root, file)
+                        if not _is_compressible(file) or not should_include(filepath):
+                            continue
+                        current_set.add(filepath)
                         try:
                             mtime = os.path.getmtime(filepath)
                         except OSError:
@@ -707,37 +839,62 @@ def watch_payloads(target_dir):
                                 log_warn(f"Watch limit reached ({MAX_WATCHED_FILES} files).")
                                 continue
                             file_states[filepath] = mtime
-                        elif file_states[filepath] < mtime:
-                            log_info(f"Change detected: {file}")
-                            file_states[filepath] = mtime
+                            continue
+                        if mtime <= file_states[filepath]:
+                            pending.pop(filepath, None)
+                            continue
+                        # Debounce rapid saves: wait until stable
+                        first_seen = pending.get(filepath)
+                        if first_seen is None:
+                            pending[filepath] = now
+                            continue
+                        if now - first_seen < DEBOUNCE_SEC:
+                            continue
+                        pending.pop(filepath, None)
+                        log_info(f"Change detected: {file}")
+                        file_states[filepath] = mtime
+                        try:
+                            res = process_single_file(filepath, target_abs, manifest)
+                            manifest_entry = res[0] if len(res) == 3 else res[0]
+                            manifest.update(manifest_entry)
+                            manifest_dirty = True
+                        except (FileSystemError, OSError) as e:
+                            log_error("WATCH", f"Failed to process changed file", {"file": filepath, "error": str(e)}, "Check file permissions", exit_code=13)
+                            continue
+                        log_sys("Cache updated and manifest rewritten.")
+                # v5.3: deleted-file cleanup every cycle (cheap: only known paths)
+                for fp in list(file_states.keys()):
+                    if fp not in current_set and not os.path.exists(fp):
+                        rel = manifest_key_for(fp, target_abs)
+                        del file_states[fp]
+                        pending.pop(fp, None)
+                        if rel in manifest:
+                            del manifest[rel]
+                            manifest_dirty = True
+                        gz = fp + ".gz"
+                        if os.path.exists(gz) and not DRY_RUN_MODE:
                             try:
-                                res = process_single_file(filepath, target_abs, manifest)
-                                manifest_entry = res[0] if len(res) == 3 else res[0]
-                                manifest.update(manifest_entry)
-                            except (FileSystemError, OSError) as e:
-                                log_error("WATCH", f"Failed to process changed file", {"file": filepath, "error": str(e)}, "Check file permissions", exit_code=13)
-                                continue
-                            if not DRY_RUN_MODE:
-                                try:
-                                    validate_manifest_keys(manifest)
-                                    with open(manifest_path, 'w', encoding='utf-8') as mf:
-                                        json.dump(manifest, mf, indent=4)
-                                except (SecurityError, PermissionError) as e:
-                                    log_warn(f"Could not update manifest: {e}")
-                            log_sys("Cache updated and manifest rewritten.")
+                                if not os.path.islink(gz):
+                                    os.remove(gz)
+                            except OSError as e:
+                                log_warn(f"Could not remove stale {gz}: {e}")
+                        log_info(f"Removed deleted file from manifest: {rel}")
+                if manifest_dirty and not DRY_RUN_MODE:
+                    try:
+                        validate_manifest_keys(manifest)
+                        with open(manifest_path, 'w', encoding='utf-8') as mf:
+                            json.dump(manifest, mf, indent=4)
+                    except (SecurityError, PermissionError, OSError) as e:
+                        log_warn(f"Could not update manifest: {e}")
                 cleanup_counter += 1
                 if cleanup_counter % 60 == 0 and len(file_states) > 10000:
-                    current_files = set()
-                    for root, dirs, files in os.walk(target_abs):
-                        for f in files:
-                            current_files.add(os.path.join(root, f))
-                    stale_count = 0
-                    for fp in list(file_states.keys()):
-                        if fp not in current_files:
-                            del file_states[fp]
-                            stale_count += 1
-                    if stale_count:
-                        log_debug(f"Cleaned {stale_count} stale entries from watch state")
+                    # Extra safety: drop any stale pointer that escaped the fast path
+                    stale = [fp for fp in file_states if fp not in current_set]
+                    for fp in stale:
+                        file_states.pop(fp, None)
+                        pending.pop(fp, None)
+                    if stale:
+                        log_debug(f"Cleaned {len(stale)} stale entries from watch state")
             except OSError as e:
                 log_error("WATCH", f"File system error during watch", {"error": str(e)}, "Check disk health and permissions", exit_code=13)
                 time.sleep(5)
@@ -789,10 +946,82 @@ def is_cache_stale(cache_dir):
         return True
 
 @with_retry(max_retries=3, base_delay=1, exceptions=(urllib.error.URLError, socket.timeout, ConnectionError))
-def fetch_url_with_retry(url, timeout=10):
-    req = urllib.request.Request(url, headers={'User-Agent': SYV_USER_AGENT})
+def fetch_url_with_retry(url, timeout=None):
+    if timeout is None:
+        timeout = get_timeout(10)
+    req = urllib.request.Request(url, headers=get_request_headers())
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return response.read(), response.getcode()
+
+def _decode_bytes(data):
+    for enc in ("utf-8", "latin-1"):
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, AttributeError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+def _extract_locs(xml_text):
+    return [loc.strip() for loc in re.findall(r'<loc>(.*?)</loc>', xml_text or "", re.IGNORECASE | re.DOTALL) if loc.strip()]
+
+def _discover_sitemap_urls(base_url):
+    # v5.3: sitemap.xml + sitemapindex recursion + robots.txt fallback
+    found = []
+    try:
+        data, status = fetch_url_with_retry(base_url + "/sitemap.xml", timeout=min(5, get_timeout(10)))
+        if status == 200:
+            text = _decode_bytes(data)
+            locs = _extract_locs(text)
+            if "<sitemapindex" in text.lower():
+                nested = []
+                for loc in locs[:20]:
+                    if not loc.lower().endswith(".xml"):
+                        continue
+                    try:
+                        validate_url_safe(loc)
+                        ndata, nstatus = fetch_url_with_retry(loc, timeout=min(5, get_timeout(10)))
+                        if nstatus == 200:
+                            nested.extend(_extract_locs(_decode_bytes(ndata)))
+                    except (SYVException, urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
+                        log_debug(f"Skipping nested sitemap {loc}: {e}")
+                        continue
+                if nested:
+                    log_info(f"Sitemap index detected. Found {len(nested)} routes in {len(locs)} sitemaps.")
+                    return nested[:1000]
+                log_debug("Sitemap index had no usable nested routes.")
+            elif locs:
+                log_info(f"Sitemap.xml detected. Found {len(locs)} routes to render.")
+                return locs[:1000]
+            log_debug("Sitemap.xml found but no <loc> entries detected.")
+        else:
+            log_debug(f"Sitemap.xml returned HTTP {status}. Trying robots.txt.")
+    except (urllib.error.HTTPError, urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError):
+        log_debug("No sitemap.xml found. Trying robots.txt.")
+    except SYVException as e:
+        log_debug(f"Sitemap fetch blocked: {e}")
+    try:
+        data, status = fetch_url_with_retry(base_url + "/robots.txt", timeout=min(5, get_timeout(10)))
+        if status == 200:
+            text = _decode_bytes(data)
+            sitemaps = [l.split(":", 1)[1].strip() for l in text.splitlines() if l.strip().lower().startswith("sitemap:")]
+            for sm in sitemaps[:5]:
+                try:
+                    validate_url_safe(sm)
+                    ndata, nstatus = fetch_url_with_retry(sm, timeout=min(5, get_timeout(10)))
+                    if nstatus == 200:
+                        locs = _extract_locs(_decode_bytes(ndata))
+                        if locs:
+                            log_info(f"robots.txt sitemap detected. Found {len(locs)} routes.")
+                            found.extend(locs)
+                except (SYVException, urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
+                    log_debug(f"Skipping robots sitemap {sm}: {e}")
+                    continue
+            if found:
+                return found[:1000]
+    except Exception:
+        pass
+    log_debug("No sitemap.xml/robots.txt routes. Defaulting to single-page / route.")
+    return [base_url]
 
 def fetch_single_route(url, base_cache_dir):
     start_time = time.time()
@@ -875,56 +1104,31 @@ def scrape_localhost(port, is_forced):
         return
     log_sys(f"{'FORCE OVERRIDE: ' if is_forced else ''}Warming HTML protocol for: {base_url}")
     t_start = time.time()
-    urls_to_scrape = [base_url]
-    try:
-        sitemap_url = f"{base_url}/sitemap.xml"
-        try:
-            sitemap_data, sitemap_status = fetch_url_with_retry(sitemap_url, timeout=5)
-            if sitemap_status == 200:
-                try:
-                    sitemap_text = sitemap_data.decode('utf-8')
-                    locs = re.findall(r'<loc>(.*?)</loc>', sitemap_text)
-                    if locs:
-                        urls_to_scrape = [loc.strip() for loc in locs]
-                        log_info(f"Sitemap.xml detected. Found {len(urls_to_scrape)} routes to render.")
-                    else:
-                        log_debug("Sitemap.xml found but no <loc> entries detected.")
-                except UnicodeDecodeError:
-                    log_debug("Sitemap.xml has non-UTF-8 encoding. Trying latin-1 fallback.")
-                    try:
-                        sitemap_text = sitemap_data.decode('latin-1')
-                        locs = re.findall(r'<loc>(.*?)</loc>', sitemap_text)
-                        if locs:
-                            urls_to_scrape = [loc.strip() for loc in locs]
-                            log_info(f"Sitemap.xml detected. Found {len(urls_to_scrape)} routes to render.")
-                    except Exception:
-                        log_debug("Could not decode sitemap.xml. Defaulting to single-page / route.")
-            else:
-                log_debug(f"Sitemap.xml returned HTTP {sitemap_status}. Defaulting to single-page / route.")
-        except (urllib.error.HTTPError, urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError):
-            log_debug("No sitemap.xml found. Defaulting to single-page / route.")
-    except Exception:
-        log_debug("No sitemap.xml found. Defaulting to single-page / route.")
+    urls_to_scrape = _discover_sitemap_urls(base_url)
     total_bytes = 0
     total_urls = len(urls_to_scrape)
     completed = 0
     successful_pages = 0
-    cpu_count = os.cpu_count() or 4
-    optimal_threads = min(cpu_count, 16)
+    failed_routes = []
+    optimal_threads = get_workers()
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_threads) as executor:
             future_to_url = {executor.submit(fetch_single_route, url, cache_dir): url for url in urls_to_scrape}
             print_progress(0, total_urls, prefix="Scraping")
             for future in concurrent.futures.as_completed(future_to_url):
+                url = future_to_url.get(future, "unknown")
                 try:
                     b_size, status = future.result()
                     if status == 200:
                         successful_pages += 1
+                    else:
+                        failed_routes.append(f"{status} {url}")
                     total_bytes += b_size
                     completed += 1
                     print_progress(completed, total_urls, prefix="Scraping")
                 except Exception as exc:
-                    log_error("SCRAPE", f"Thread failed", {"url": future_to_url.get(future, "unknown"), "error": str(exc)}, "", exit_code=1)
+                    failed_routes.append(f"thread-fail {url}: {exc}")
+                    log_error("SCRAPE", f"Thread failed", {"url": url, "error": str(exc)}, "", exit_code=1)
     except MemoryError:
         log_error("SCRAPE", "Out of memory - too many concurrent requests", {"threads": optimal_threads, "urls": total_urls}, "Reduce thread count or process fewer URLs", exit_code=8)
         log_sys("Falling back to sequential scraping...")
@@ -932,6 +1136,8 @@ def scrape_localhost(port, is_forced):
             b_size, status = fetch_single_route(url, cache_dir)
             if status == 200:
                 successful_pages += 1
+            else:
+                failed_routes.append(f"{status} {url}")
             total_bytes += b_size
             completed += 1
             print_progress(completed, total_urls, prefix="Scraping")
@@ -941,6 +1147,10 @@ def scrape_localhost(port, is_forced):
     if not DRY_RUN_MODE and total_bytes > 0:
         write_html_manifest(cache_dir, total_bytes, 200)
     log_info(f"SSG Protocol Complete. Cached {successful_pages}/{total_urls} pages ({total_bytes / 1024:.2f} KB) in {time.time() - t_start:.2f}s")
+    if failed_routes:
+        log_warn(f"{len(failed_routes)} routes failed:")
+        for fr in failed_routes[:15]:
+            sys.stdout.write(f"  - {fr}\n")
 
 
 # --- MODULE 3: Gzip-aware Static Server (v5.2) ---
@@ -1126,6 +1336,106 @@ def stats_directory(target_dir):
     print("")
 
 
+# --- MODULE 5: Consistency Checker (v5.3) ---
+def check_directory(target_dir, as_json=False):
+    target_abs = os.path.abspath(target_dir)
+    errors = []
+    warnings = []
+    checked = 0
+    if not os.path.isdir(target_abs):
+        msg = f"Directory not found: {target_abs}"
+        if as_json:
+            print(json.dumps({"ok": False, "target": target_abs, "errors": [msg], "warnings": [], "checked": 0}))
+        else:
+            log_error("CHECK", msg, recovery=f"Specify a valid dir: syv check ./dist", exit_code=1)
+        return False
+    manifest_path = os.path.join(target_abs, "build_manifest.json")
+    manifest = {}
+    if not os.path.exists(manifest_path):
+        errors.append("missing build_manifest.json (run syv build first)")
+    else:
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as mf:
+                loaded = json.load(mf)
+            if not isinstance(loaded, dict):
+                errors.append("build_manifest.json is not a JSON object")
+            else:
+                manifest = loaded
+                try:
+                    validate_manifest_keys(manifest)
+                except SecurityError as e:
+                    errors.append(f"manifest security: {e}")
+        except json.JSONDecodeError as e:
+            errors.append(f"build_manifest.json invalid JSON (line {e.lineno}): {e.msg}")
+        except OSError as e:
+            errors.append(f"cannot read build_manifest.json: {e}")
+    manifest_values = set(manifest.values()) if isinstance(manifest, dict) else set()
+    for key, vers in (manifest.items() if isinstance(manifest, dict) else []):
+        checked += 1
+        src = os.path.join(target_abs, key.replace("/", os.sep))
+        if not os.path.isfile(src):
+            errors.append(f"manifest entry missing file: {key}")
+            continue
+        if "?v=" not in str(vers):
+            warnings.append(f"manifest value without ?v=: {key} -> {vers}")
+        else:
+            try:
+                stored_hash = str(vers).rsplit("?v=", 1)[1].split("&")[0].split('"')[0].split("'")[0]
+                current_hash = generate_file_hash(src)
+                # HTML files legitimately change after DOM injection (phase 2);
+                # their stored hash was taken post-rewrite, so a mismatch here
+                # means the file changed again afterwards -> stale.
+                if stored_hash != current_hash:
+                    # Re-check: if HTML still contains its own versioned ref, ignore self-hash churn?
+                    # No — any mismatch means `syv build` must re-run.
+                    errors.append(f"stale hash: {key} manifest={stored_hash} current={current_hash}")
+            except FileSystemError as e:
+                errors.append(f"cannot hash {key}: {e}")
+        gz = src + ".gz"
+        if not os.path.exists(gz):
+            errors.append(f"missing .gz: {key}.gz (run syv build)")
+        else:
+            try:
+                if os.path.getmtime(gz) < os.path.getmtime(src):
+                    errors.append(f"outdated .gz (older than source): {key}.gz")
+            except OSError:
+                pass
+    # HTML reference check: every ?v= ref should exist in manifest values
+    for root, dirs, files in os.walk(target_abs):
+        dirs[:] = [d for d in dirs if not is_ignored(os.path.join(root, d))]
+        for file in files:
+            if not file.lower().endswith(".html"):
+                continue
+            fp = os.path.join(root, file)
+            try:
+                content = read_file_with_fallback(fp)
+            except FileSystemError:
+                continue
+            for m in re.finditer(r'(?:src|href)=["\']([^"\']+\?v=[a-fA-F0-9]{6,16})["\']', content):
+                ref = m.group(1)
+                # Normalize ./ and leading / for comparison
+                norm = ref.lstrip("./")
+                if ref not in manifest_values and norm not in manifest_values and os.path.basename(ref) not in [str(v).split("?")[0].split("/")[-1] for v in manifest_values]:
+                    warnings.append(f"{os.path.relpath(fp, target_abs).replace(os.sep, '/')}: unmapped versioned ref {ref}")
+    ok = len(errors) == 0
+    if as_json:
+        print(json.dumps({"ok": ok, "target": target_abs, "checked": checked,
+                          "manifest_entries": len(manifest) if isinstance(manifest, dict) else 0,
+                          "errors": errors, "warnings": warnings}))
+    else:
+        if ok:
+            log_info(f"CHECK OK: {checked} entries, {len(warnings)} warnings in {target_abs}")
+            for w in warnings[:20]:
+                log_warn(w)
+        else:
+            log_error("CHECK", f"FAILED: {len(errors)} errors, {len(warnings)} warnings", {"target": target_abs}, "Run syv build ./dist then syv check ./dist", exit_code=1)
+            for e in errors[:30]:
+                sys.stdout.write(f"  - {e}\n")
+            for w in warnings[:10]:
+                sys.stdout.write(f"  (warn) {w}\n")
+    return ok
+
+
 # --- Router Logic ---
 def extract_port(args):
     port = CONFIG.get("port", 8080)
@@ -1160,6 +1470,7 @@ def print_help():
     print("  watch [dir]           Live-monitor [dir] and recompile on file save.")
     print("  serve [dir]           Serve [dir] on localhost with gzip negotiation.")
     print("  stats [dir]           Show compression savings + cache report.")
+    print("  check [dir]           Verify manifest + .gz + HTML hashes (CI gate).")
     print("  version               Print syv version.")
     print("  clean [dir]           Purge all .gz files, manifests, and syv_cache.")
     print("  run update            Scrape localhost (and sitemap.xml) to generate SSG cache.")
@@ -1167,11 +1478,16 @@ def print_help():
     print("Options:")
     print("  -p, --port <number>   Target localhost port (serve + run update).")
     print("  --debug               Enable verbose millisecond execution logging.")
-    print("  --dry-run             Simulate actions without writing/deleting any files.\n")
+    print("  --dry-run             Simulate actions without writing/deleting any files.")
+    print("  --json                Machine-readable output (check, stats for CI).\n")
 
 def main():
     global DEBUG_MODE, DRY_RUN_MODE
     args = sys.argv[1:]
+    want_json = False
+    if "--json" in args:
+        want_json = True
+        args.remove("--json")
     if "--debug" in args:
         DEBUG_MODE = True
         args.remove("--debug")
@@ -1181,6 +1497,31 @@ def main():
         args.remove("--dry-run")
         log_sys("DRY-RUN MODE ENGAGED: No files will be modified.")
     load_config()
+    # v5.3: optional file logging (tee stdout)
+    _log_fh = None
+    try:
+        log_file = CONFIG.get("log_file")
+        if log_file:
+            _log_fh = open(log_file, "a", encoding="utf-8")
+            _orig_stdout = sys.stdout
+            class _Tee:
+                def __init__(self, *streams):
+                    self.streams = streams
+                def write(self, data):
+                    for s in self.streams:
+                        try:
+                            s.write(data)
+                        except Exception:
+                            pass
+                def flush(self):
+                    for s in self.streams:
+                        try:
+                            s.flush()
+                        except Exception:
+                            pass
+            sys.stdout = _Tee(_orig_stdout, _log_fh)
+    except OSError as e:
+        log_warn(f"Could not open log_file: {e}")
     if not args or args[0] in ["help", "-h", "--help"]:
         print_help()
         sys.exit(0)
@@ -1216,6 +1557,15 @@ def main():
             serve_directory(serve_dir, port)
         elif command == "stats":
             stats_directory(args[1] if len(args) > 1 and not args[1].startswith("-") else "./dist")
+        elif command == "check":
+            target = "./dist"
+            for a in args[1:]:
+                if not a.startswith("-"):
+                    target = a
+                    break
+            ok = check_directory(target, as_json=want_json)
+            if not ok:
+                sys.exit(1)
         elif command == "force" and len(args) >= 3 and args[1] == "run" and args[2] == "update":
             scrape_localhost(port, is_forced=True)
         elif command == "run" and len(args) >= 2 and args[1] == "update":

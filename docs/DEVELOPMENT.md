@@ -26,8 +26,15 @@ Since `syv` relies entirely on Python's standard library, the setup is extremely
 
 ---
 
-## 🧪 Testing Your Changes (The Sandbox)
+## 🧪 Testing Your Changes
 
+### 0. Automated Tests (v5.3+, preferred)
+```bash
+python -m unittest discover -s tests -v
+```
+Stdlib-only (`unittest`, no pytest). Covers relative manifest keys, idempotent rewrite, incremental skip, `check` pass/fail, glob ignore/include, config validation, and URL allowlist. CI runs the same on Ubuntu + Windows.
+
+### 1. Manual Sandbox
 You don't need a complex React app or a live database to test `syv`. You can simulate the full SSG, SPA, and Security environments using basic terminal commands.
 
 ### 1. Testing SPA Mode & DOM Rewriter

@@ -1,5 +1,5 @@
 # ⚡ syv
-**The Zero-Dependency Optimization Daemon (v5.2)**
+**The Zero-Dependency Optimization Daemon (v5.3)**
  
 [![Python 3.6+](https://img.shields.io/badge/python-3.6+-blue.svg)](https://www.python.org/downloads/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)]()
@@ -140,9 +140,24 @@ sudo mv syv /usr/local/bin/
   "port": 3000,
   "ignore": ["node_modules", ".git", ".venv", "tests", "syv_cache"],
   "ttl": 3600,
-  "silent_mode": false
+  "silent_mode": false,
+  "workers": 0,
+  "gzip_level": 9,
+  "include": [],
+  "exclude": ["*.map"],
+  "timeout": 10,
+  "headers": {},
+  "allowlist": ["staging.internal"],
+  "log_file": null
 }
 ```
+
+* `workers: 0` = auto (CPU count, max 16), `1-32` = fixed pool for build + scrape.
+* `gzip_level: 1-9` (9 = max compression, 1 = fastest).
+* `include/exclude`: glob filters (`*.map`, `js/*`) applied after `ignore`.
+* `timeout`: scraper HTTP seconds (1-120). `headers`: extra request headers (e.g. `Authorization`).
+* `allowlist`: extra non-localhost hosts the scraper may fetch (SSRF guard stays on otherwise).
+* `log_file`: tee all output to a file as well as the terminal.
 
 ---
 
@@ -159,15 +174,17 @@ syv build ./dist --dry-run # Simulate operations without disk I/O
 ### SPA Operations (Frontend Bundles)
 ```bash
 syv build ./dist           # Incremental multi-threaded build + DOM injection
-syv watch ./dist           # Initialize the live-reload daemon
+syv watch ./dist           # Debounced live-reload daemon (deleted files pruned)
 syv serve ./dist -p 8080   # Gzip-aware local preview server (New in v5.2)
 syv stats ./dist           # Compression savings + cache report (New in v5.2)
+syv check ./dist           # Verify manifest + .gz + HTML hashes, exit 1 on fail (New in v5.3)
+syv check ./dist --json    # Machine-readable gate for CI (New in v5.3)
 syv build ./dist --debug   # Enable verbose, actionable execution logs
 ```
 
 ### SSG Operations (Backend Endpoints)
 ```bash
-syv run update             # Scrapes default port (8080 or config port)
+syv run update             # Scrapes sitemap.xml / sitemapindex / robots.txt (v5.3)
 syv run update -p 5000     # Scrape specific port
 syv force run update       # Bypass TTL checks and force hard rebuild
 ```
@@ -203,8 +220,20 @@ jobs:
         run: |
           chmod +x ./syv
           ./syv build ./dist
+      - name: Gate on consistency
+        run: |
+          ./syv check ./dist
+          ./syv stats ./dist
       - name: Deploy to Production
         run: echo "Deploying highly optimized, secure payloads..."
+```
+
+### Testing
+
+Zero dependencies, stdlib only:
+
+```bash
+python -m unittest discover -s tests -v
 ```
 
 ---
